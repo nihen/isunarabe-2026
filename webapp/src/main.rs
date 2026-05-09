@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use axum::{
     body::Body,
     extract::{FromRequest, Path as AxumPath, Query as AxumQuery, Request, State},
@@ -51,6 +54,7 @@ enum DbWrite {
         created_at: NaiveDateTime,
     },
 }
+use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -555,7 +559,7 @@ async fn main() {
         let serve = ServeDir::new(&dir).not_found_service(ServeFile::new(index));
         app = app.fallback_service(serve);
     }
-    let app = app.with_state(state);
+    let app = app.with_state(state).layer(CompressionLayer::new().gzip(true));
 
     let port: u16 = std::env::var("PORT")
         .unwrap_or_else(|_| "8080".to_string())
@@ -1226,7 +1230,10 @@ async fn join_campaign(
     // Update caches — reuse serialized bytes
     state.store.campaign_json_cache.write()
         .insert(campaign_id.clone(), response_bytes.clone());
-    state.store.list_cache.write().clear();
+    // Only clear list cache when campaign closes (not on every join)
+    if after == goal_count {
+        state.store.list_cache.write().clear();
+    }
 
     // Sync to replicas
     {
