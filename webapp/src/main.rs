@@ -379,7 +379,7 @@ impl Store {
         let bytes = serde_json::to_vec(&camp.to_response(campaign_id)).unwrap_or_default();
         self.campaign_json_cache.write().await
             .insert(campaign_id.to_string(), Arc::new(bytes));
-        *self.list_cache_dirty.write().await = true;
+        self.list_cache.write().await.clear();
     }
 }
 
@@ -762,26 +762,23 @@ async fn list_campaigns(
     tag_ids.sort();
     let cache_key = format!("sort={sort_mode};tags={}", tag_ids.join(","));
 
-    // Rebuild if dirty
-    state.store.rebuild_list_cache_if_dirty().await;
-
-    let cache = state.store.list_cache.read().await;
-    if let Some(body) = cache.get(&cache_key) {
-        return Ok(response_from_json_bytes(body.clone()));
+    // Check cache
+    if let Some(body) = state.store.list_cache.read().await.get(&cache_key).cloned() {
+        return Ok(response_from_json_bytes(body));
     }
-    drop(cache);
 
-    // Fallback: compute on demand (shouldn't happen if rebuild covers all combos)
-    let campaigns = state.store.campaigns.read().await;
+    // Cache miss: compute just this key
     let filter_tag_names: Vec<String> = {
         let tag_name_map = state.store.tag_name_by_id.read().await;
         tag_ids.iter().filter_map(|id| tag_name_map.get(id).cloned()).collect()
     };
+    let campaigns = state.store.campaigns.read().await;
     let mut open: Vec<CampaignRes> = campaigns.iter()
         .filter(|(_, c)| c.status == "open")
         .filter(|(_, c)| filter_tag_names.iter().all(|tag| c.tags.contains(tag)))
         .map(|(id, c)| c.to_response(id))
         .collect();
+    drop(campaigns);
     if sort_mode == "active" {
         open.sort_by(|a, b| {
             let ak = a.last_joined_at.unwrap_or(a.created_at);
@@ -792,8 +789,9 @@ async fn list_campaigns(
         open.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     }
     open.truncate(30);
-    let bytes = serde_json::to_vec(&open).unwrap_or_default();
-    Ok(response_from_json_bytes(Arc::new(bytes)))
+    let bytes = Arc::new(serde_json::to_vec(&open).unwrap_or_default());
+    state.store.list_cache.write().await.insert(cache_key, bytes.clone());
+    Ok(response_from_json_bytes(bytes))
 }
 
 async fn get_campaign(
