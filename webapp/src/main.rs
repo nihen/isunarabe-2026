@@ -546,7 +546,7 @@ async fn resolve_tag_ids(state: &AppState, tag_names: &[String]) -> Result<Vec<S
         let tag_id = tag_ids_by_name.get(name).ok_or(AppError::BadRequest)?;
         tag_ids.push(tag_id.clone());
     }
-    *state.cache.tag_ids_by_name.write().await = tag_ids_by_name;
+    *state.cache.tag_ids_by_name.write().await = tag_ids_by_name.clone();
     Ok(tag_ids)
 }
 
@@ -566,7 +566,7 @@ async fn list_tags(State(state): State<AppState>) -> Result<Response, AppError> 
     }
     let body = serialize_json(&tags)?;
     *state.cache.tags_json.write().await = Some(body.clone());
-    *state.cache.tag_ids_by_name.write().await = tag_ids_by_name;
+    *state.cache.tag_ids_by_name.write().await = tag_ids_by_name.clone();
     Ok(response_from_json_bytes(body))
 }
 
@@ -777,7 +777,7 @@ async fn warm_read_cache(state: &AppState) -> Result<(), AppError> {
         tag_ids_by_name.insert(name, id);
     }
     *state.cache.tags_json.write().await = Some(serialize_json(&tags)?);
-    *state.cache.tag_ids_by_name.write().await = tag_ids_by_name;
+    *state.cache.tag_ids_by_name.write().await = tag_ids_by_name.clone();
 
     let user_rows: Vec<(String,)> = sqlx::query_as("SELECT id FROM users")
         .fetch_all(&state.pool)
@@ -845,23 +845,12 @@ async fn warm_read_cache(state: &AppState) -> Result<(), AppError> {
     }
     *state.cache.campaign_json.write().await = campaign_json;
 
-    let mut open_campaigns: Vec<CampaignRes> = campaigns
-        .into_iter()
+    let open_campaigns: Vec<CampaignRes> = campaigns
+        .iter()
         .filter(|campaign| campaign.status == "open")
+        .cloned()
         .collect();
-    open_campaigns.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    let latest: Vec<CampaignRes> = open_campaigns.iter().take(30).cloned().collect();
-
-    open_campaigns.sort_by(|a, b| {
-        let ak = a.last_joined_at.unwrap_or(a.created_at);
-        let bk = b.last_joined_at.unwrap_or(b.created_at);
-        bk.cmp(&ak)
-    });
-    let active: Vec<CampaignRes> = open_campaigns.iter().take(30).cloned().collect();
-
-    let mut list_cache = HashMap::new();
-    list_cache.insert("sort=new;tags=".to_string(), serialize_json(&latest)?);
-    list_cache.insert("sort=active;tags=".to_string(), serialize_json(&active)?);
+    let list_cache = build_warmed_list_cache(&open_campaigns, &tag_ids_by_name)?;
     *state.cache.list_campaigns_json.write().await = list_cache;
 
     let image_rows: Vec<(String, Vec<u8>)> = sqlx::query_as("SELECT id, image FROM campaigns")
@@ -881,6 +870,90 @@ async fn warm_read_cache(state: &AppState) -> Result<(), AppError> {
     *state.cache.campaign_image.write().await = image_cache;
 
     Ok(())
+}
+
+fn build_warmed_list_cache(
+    open_campaigns: &[CampaignRes],
+    tag_ids_by_name: &HashMap<String, String>,
+) -> Result<HashMap<String, Arc<Vec<u8>>>, AppError> {
+    let mut list_cache = HashMap::new();
+    insert_list_cache(&mut list_cache, open_campaigns, &[], &[])?;
+
+    let mut tag_pairs: Vec<(&String, &String)> = tag_ids_by_name.iter().collect();
+    tag_pairs.sort_by(|a, b| a.0.cmp(b.0));
+    for i in 0..tag_pairs.len() {
+        insert_list_cache(
+            &mut list_cache,
+            open_campaigns,
+            &[tag_pairs[i].0.as_str()],
+            &[tag_pairs[i].1.as_str()],
+        )?;
+        for j in i + 1..tag_pairs.len() {
+            insert_list_cache(
+                &mut list_cache,
+                open_campaigns,
+                &[tag_pairs[i].0.as_str(), tag_pairs[j].0.as_str()],
+                &[tag_pairs[i].1.as_str(), tag_pairs[j].1.as_str()],
+            )?;
+            for k in j + 1..tag_pairs.len() {
+                insert_list_cache(
+                    &mut list_cache,
+                    open_campaigns,
+                    &[
+                        tag_pairs[i].0.as_str(),
+                        tag_pairs[j].0.as_str(),
+                        tag_pairs[k].0.as_str(),
+                    ],
+                    &[
+                        tag_pairs[i].1.as_str(),
+                        tag_pairs[j].1.as_str(),
+                        tag_pairs[k].1.as_str(),
+                    ],
+                )?;
+            }
+        }
+    }
+    Ok(list_cache)
+}
+
+fn insert_list_cache(
+    list_cache: &mut HashMap<String, Arc<Vec<u8>>>,
+    open_campaigns: &[CampaignRes],
+    tag_names: &[&str],
+    tag_ids: &[&str],
+) -> Result<(), AppError> {
+    let mut filtered: Vec<CampaignRes> = open_campaigns
+        .iter()
+        .filter(|campaign| {
+            tag_names
+                .iter()
+                .all(|tag_name| campaign.tags.iter().any(|tag| tag == tag_name))
+        })
+        .cloned()
+        .collect();
+
+    filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let latest: Vec<CampaignRes> = filtered.iter().take(30).cloned().collect();
+    let tag_key = sorted_tag_key(tag_ids);
+    list_cache.insert(format!("sort=new;tags={tag_key}"), serialize_json(&latest)?);
+
+    filtered.sort_by(|a, b| {
+        let ak = a.last_joined_at.unwrap_or(a.created_at);
+        let bk = b.last_joined_at.unwrap_or(b.created_at);
+        bk.cmp(&ak)
+    });
+    let active: Vec<CampaignRes> = filtered.iter().take(30).cloned().collect();
+    list_cache.insert(
+        format!("sort=active;tags={tag_key}"),
+        serialize_json(&active)?,
+    );
+    Ok(())
+}
+
+fn sorted_tag_key(tag_ids: &[&str]) -> String {
+    let mut sorted = tag_ids.to_vec();
+    sorted.sort_unstable();
+    sorted.join(",")
 }
 
 #[derive(Deserialize)]
