@@ -1134,22 +1134,41 @@ async fn join_campaign(
             user_name = user.name.clone();
         }
 
-        // Phase 2: Add participant (mutable borrow of campaigns only)
-        let after;
-        {
-            let camp = d.campaigns.get_mut(&campaign_id).unwrap();
-            camp.participants.push(ParticipantRes {
-                user_id: user_id_s.clone(), name: user_name.clone(), joined_at: now,
-            });
-            camp.participant_user_ids.insert(user_id_s.clone());
-            camp.last_joined_at = Some(now);
-            after = camp.current_count();
-        }
+        // Phase 2: Add participant + credit + close (all mutations)
+        let camp = d.campaigns.get_mut(&campaign_id).unwrap();
+        camp.participants.push(ParticipantRes {
+            user_id: user_id_s.clone(), name: user_name.clone(), joined_at: now,
+        });
+        camp.participant_user_ids.insert(user_id_s.clone());
+        camp.last_joined_at = Some(now);
+        let after = camp.current_count();
 
-        // Phase 3: Update joining user's credit
         d.users.get_mut(&user_id_s).unwrap().open_credit_used += price;
 
-        // Phase 4: Notification check (immutable borrow of saved_searches only)
+        // Campaign close (mutations)
+        if after == goal_count {
+            let camp = d.campaigns.get_mut(&campaign_id).unwrap();
+            camp.status = "closed".to_string();
+            let participant_uids: Vec<String> = camp.participant_user_ids.iter().cloned().collect();
+            let camp_name = camp.name.clone();
+            for uid in &participant_uids {
+                if let Some(u) = d.users.get_mut(uid) {
+                    u.open_credit_used -= price;
+                }
+                let charge = ChargeEntry {
+                    id: Uuid::new_v4().to_string(), amount: price,
+                    campaign_id: campaign_id.clone(), campaign_name: camp_name.clone(),
+                    campaign_price: price, created_at: now,
+                };
+                d.charges.entry(uid.clone()).or_default().insert(0, charge);
+            }
+        }
+
+        drop(d); // ★ WRITE LOCK RELEASED — reads unblocked
+
+        // Phase 3: Notification + response (READ lock only)
+        let d = state.store.data.read();
+
         let mut webhook_user_ids: Vec<String> = Vec::new();
         if after == goal_count - 1 {
             let mut seen = HashSet::new();
@@ -1164,49 +1183,18 @@ async fn join_campaign(
             }
         }
 
-        // Phase 5: Campaign close
-        let mut new_charges_sync: Vec<SyncCharge> = Vec::new();
-        if after == goal_count {
-            // Get participant_uids and camp_name from campaign, then drop borrow
-            let (participant_uids, camp_name) = {
-                let camp = d.campaigns.get_mut(&campaign_id).unwrap();
-                camp.status = "closed".to_string();
-                let uids: Vec<String> = camp.participant_user_ids.iter().cloned().collect();
-                let name = camp.name.clone();
-                (uids, name)
-            };
-            // Now camp borrow is dropped — can access users and charges freely
-            for uid in &participant_uids {
-                if let Some(u) = d.users.get_mut(uid) {
-                    u.open_credit_used -= price;
-                }
-                let charge = ChargeEntry {
-                    id: Uuid::new_v4().to_string(),
-                    amount: price,
-                    campaign_id: campaign_id.clone(),
-                    campaign_name: camp_name.clone(),
-                    campaign_price: price,
-                    created_at: now,
-                };
-                new_charges_sync.push(SyncCharge {
-                    user_id: uid.clone(), charge_id: charge.id.clone(),
-                    campaign_id: charge.campaign_id.clone(), campaign_name: charge.campaign_name.clone(),
-                    campaign_price: charge.campaign_price, created_at: charge.created_at,
-                });
-                d.charges.entry(uid.clone()).or_default().insert(0, charge);
-            }
-        }
-
-        // Phase 6: Build response (immutable borrow)
         let camp = d.campaigns.get(&campaign_id).unwrap();
         let response = camp.to_response(&campaign_id);
         let response_bytes = Arc::new(serde_json::to_vec(&response)
             .map_err(|e| AppError::Internal(format!("json: {e}")))?);
         let webhook_url = d.webhook_url.clone();
+        let new_charges_sync = Vec::<SyncCharge>::new();
+
+        drop(d); // read lock released
 
         (response, response_bytes, webhook_url, webhook_user_ids, user_name,
          after, goal_count, price, new_charges_sync)
-    }; // d dropped here — BEFORE any .await
+    };
 
     // Update caches — reuse serialized bytes
     state.store.campaign_json_cache.write()
