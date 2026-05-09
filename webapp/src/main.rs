@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::mpsc;
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -59,21 +59,25 @@ struct WebhookMessage {
 // ── In-memory store ──
 
 struct Store {
-    users: RwLock<HashMap<String, MemUser>>,
-    campaigns: RwLock<HashMap<String, MemCampaign>>,
-    tags: RwLock<Vec<String>>,
-    tag_id_by_name: RwLock<HashMap<String, String>>,
-    tag_name_by_id: RwLock<HashMap<String, String>>,
-    saved_searches: RwLock<HashMap<String, Vec<MemSavedSearch>>>,
-    charges: RwLock<HashMap<String, Vec<ChargeEntry>>>,
-    webhook_url: RwLock<String>,
-    campaign_image: RwLock<HashMap<String, ImageCache>>,
-    write_lock: Mutex<()>,
+    data: parking_lot::RwLock<StoreData>,
+    // Async-safe for image I/O
+    campaign_image: tokio::sync::RwLock<HashMap<String, ImageCache>>,
     // Pre-computed list responses (rebuilt on join/create, not on every list request)
-    list_cache_dirty: RwLock<bool>,
-    list_cache: RwLock<HashMap<String, Arc<Vec<u8>>>>,
+    list_cache_dirty: parking_lot::RwLock<bool>,
+    list_cache: parking_lot::RwLock<HashMap<String, Arc<Vec<u8>>>>,
     // Pre-serialized campaign responses
-    campaign_json_cache: RwLock<HashMap<String, Arc<Vec<u8>>>>,
+    campaign_json_cache: parking_lot::RwLock<HashMap<String, Arc<Vec<u8>>>>,
+}
+
+struct StoreData {
+    users: HashMap<String, MemUser>,
+    campaigns: HashMap<String, MemCampaign>,
+    tags: Vec<String>,
+    tag_id_by_name: HashMap<String, String>,
+    tag_name_by_id: HashMap<String, String>,
+    saved_searches: HashMap<String, Vec<MemSavedSearch>>,
+    charges: HashMap<String, Vec<ChargeEntry>>,
+    webhook_url: String,
 }
 
 #[derive(Clone)]
@@ -185,19 +189,20 @@ struct ImageCache {
 impl Store {
     fn new() -> Self {
         Store {
-            users: RwLock::new(HashMap::new()),
-            campaigns: RwLock::new(HashMap::new()),
-            tags: RwLock::new(Vec::new()),
-            tag_id_by_name: RwLock::new(HashMap::new()),
-            tag_name_by_id: RwLock::new(HashMap::new()),
-            saved_searches: RwLock::new(HashMap::new()),
-            charges: RwLock::new(HashMap::new()),
-            webhook_url: RwLock::new(String::new()),
-            campaign_image: RwLock::new(HashMap::new()),
-            write_lock: Mutex::new(()),
-            list_cache_dirty: RwLock::new(true),
-            list_cache: RwLock::new(HashMap::new()),
-            campaign_json_cache: RwLock::new(HashMap::new()),
+            data: parking_lot::RwLock::new(StoreData {
+                users: HashMap::new(),
+                campaigns: HashMap::new(),
+                tags: Vec::new(),
+                tag_id_by_name: HashMap::new(),
+                tag_name_by_id: HashMap::new(),
+                saved_searches: HashMap::new(),
+                charges: HashMap::new(),
+                webhook_url: String::new(),
+            }),
+            campaign_image: tokio::sync::RwLock::new(HashMap::new()),
+            list_cache_dirty: parking_lot::RwLock::new(true),
+            list_cache: parking_lot::RwLock::new(HashMap::new()),
+            campaign_json_cache: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -213,9 +218,6 @@ impl Store {
             tag_id_by_name.insert(name.clone(), id.clone());
             tag_name_by_id.insert(id, name);
         }
-        *self.tags.write().await = tags;
-        *self.tag_id_by_name.write().await = tag_id_by_name;
-        *self.tag_name_by_id.write().await = tag_name_by_id;
 
         // Users
         let user_rows: Vec<(String, String, i32)> =
@@ -246,16 +248,14 @@ impl Store {
         let ct_rows: Vec<(String, String)> =
             sqlx::query_as("SELECT campaign_id, tag_id FROM campaign_tags")
                 .fetch_all(pool).await?;
-        let tag_name_map = self.tag_name_by_id.read().await;
         for (cid, tid) in ct_rows {
             if let Some(camp) = campaigns.get_mut(&cid) {
-                if let Some(name) = tag_name_map.get(&tid) {
+                if let Some(name) = tag_name_by_id.get(&tid) {
                     camp.tags.push(name.clone());
                 }
                 camp.tag_ids.push(tid);
             }
         }
-        drop(tag_name_map);
 
         // Participants
         let part_rows: Vec<(String, String, String, NaiveDateTime)> = sqlx::query_as(
@@ -280,7 +280,7 @@ impl Store {
                 camp.status = "closed".to_string();
             }
         }
-        for (cid, camp) in &campaigns {
+        for (_cid, camp) in &campaigns {
             if camp.status == "open" {
                 for p in &camp.participants {
                     if let Some(user) = users.get_mut(&p.user_id) {
@@ -289,9 +289,6 @@ impl Store {
                 }
             }
         }
-
-        *self.users.write().await = users;
-        *self.campaigns.write().await = campaigns;
 
         // Charges
         let charge_rows: Vec<(String, NaiveDateTime, String, String, String, i32)> =
@@ -310,7 +307,6 @@ impl Store {
                 campaign_price: cprice, created_at,
             });
         }
-        *self.charges.write().await = charges;
 
         // Saved searches
         let ss_rows: Vec<(String, String)> =
@@ -328,42 +324,46 @@ impl Store {
             let tag_ids = ss_tags.remove(&ssid).unwrap_or_default();
             saved_searches.entry(uid).or_default().push(MemSavedSearch { tag_ids });
         }
-        *self.saved_searches.write().await = saved_searches;
 
         // Webhook URL
         let url_row: Option<(String,)> = sqlx::query_as(
             "SELECT value FROM app_config WHERE name = 'notification_webhook_url'",
         )
         .fetch_optional(pool).await?;
-        *self.webhook_url.write().await = url_row.map(|(v,)| v).unwrap_or_default();
+        let webhook_url = url_row.map(|(v,)| v).unwrap_or_default();
+
+        // Replace all data at once (single write lock)
+        *self.data.write() = StoreData {
+            users, campaigns, tags, tag_id_by_name, tag_name_by_id,
+            saved_searches, charges, webhook_url,
+        };
 
         // Clear image cache (will warm lazily)
         self.campaign_image.write().await.clear();
 
         // Rebuild list cache + campaign JSON cache
-        *self.list_cache_dirty.write().await = true;
-        self.campaign_json_cache.write().await.clear();
-        self.rebuild_list_cache_if_dirty().await;
+        *self.list_cache_dirty.write() = true;
+        self.campaign_json_cache.write().clear();
+        self.rebuild_list_cache_if_dirty();
 
         Ok(())
     }
 
-    async fn rebuild_list_cache_if_dirty(&self) {
+    fn rebuild_list_cache_if_dirty(&self) {
         {
-            let dirty = self.list_cache_dirty.read().await;
+            let dirty = self.list_cache_dirty.read();
             if !*dirty { return; }
         }
 
-        let campaigns = self.campaigns.read().await;
-        let tag_map = self.tag_id_by_name.read().await;
+        let d = self.data.read();
 
-        let open: Vec<(String, &MemCampaign)> = campaigns.iter()
+        let open: Vec<(String, &MemCampaign)> = d.campaigns.iter()
             .filter(|(_, c)| c.status == "open")
             .map(|(id, c)| (id.clone(), c))
             .collect();
 
         let mut cache = HashMap::new();
-        let tag_names: Vec<&String> = tag_map.keys().collect();
+        let tag_names: Vec<&String> = d.tag_id_by_name.keys().collect();
 
         // Build all tag combinations (0, 1, 2, 3 tags)
         let mut tag_combos: Vec<Vec<&str>> = vec![vec![]]; // empty = no filter
@@ -400,7 +400,7 @@ impl Store {
             by_active.truncate(30);
 
             let mut tag_ids: Vec<&str> = combo.iter()
-                .filter_map(|name| tag_map.get(*name).map(|id| id.as_str()))
+                .filter_map(|name| d.tag_id_by_name.get(*name).map(|id| id.as_str()))
                 .collect();
             tag_ids.sort();
             let tag_key = tag_ids.join(",");
@@ -411,18 +411,17 @@ impl Store {
             cache.insert(format!("sort=active;tags={tag_key}"), Arc::new(active_bytes));
         }
 
-        drop(campaigns);
-        drop(tag_map);
+        drop(d);
 
-        *self.list_cache.write().await = cache;
-        *self.list_cache_dirty.write().await = false;
+        *self.list_cache.write() = cache;
+        *self.list_cache_dirty.write() = false;
     }
 
-    async fn invalidate_campaign(&self, campaign_id: &str, camp: &MemCampaign) {
+    fn invalidate_campaign(&self, campaign_id: &str, camp: &MemCampaign) {
         let bytes = serde_json::to_vec(&camp.to_response(campaign_id)).unwrap_or_default();
-        self.campaign_json_cache.write().await
+        self.campaign_json_cache.write()
             .insert(campaign_id.to_string(), Arc::new(bytes));
-        self.list_cache.write().await.clear();
+        self.list_cache.write().clear();
     }
 }
 
@@ -590,7 +589,7 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .ok_or(AppError::Unauthorized)?
         .to_string();
-    if !state.store.users.read().await.contains_key(&user_id) {
+    if !state.store.data.read().users.contains_key(&user_id) {
         return Err(AppError::Unauthorized);
     }
     req.extensions_mut().insert(AuthUser(user_id));
@@ -747,14 +746,11 @@ async fn create_user(
         .bind(&id).bind(&req.name).bind(credit_limit).bind(now)
         .execute(&state.pool).await?;
 
-    let _guard = state.store.write_lock.lock().await;
-    state.store.users.write().await.insert(id.clone(), MemUser {
+    state.store.data.write().users.insert(id.clone(), MemUser {
         name: req.name.clone(), credit_limit, open_credit_used: 0,
     });
-    drop(_guard);
 
     let event = SyncEvent::UserCreated { id: id.clone(), name: req.name.clone(), credit_limit };
-    let st = state.clone();
     broadcast_sync(&state, &event).await;
 
     Ok(Json(UserRes { id, name: req.name, credit_limit }))
@@ -765,21 +761,23 @@ async fn get_me(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Json<MeRes>, AppError> {
     let user_id_s = user_id;
-    let users = state.store.users.read().await;
-    let user = users.get(&user_id_s).ok_or(AppError::Unauthorized)?;
-    Ok(Json(MeRes {
+    let d = state.store.data.read();
+    let user = d.users.get(&user_id_s).ok_or(AppError::Unauthorized)?;
+    let result = MeRes {
         id: user_id_s,
         name: user.name.clone(),
         credit_limit: user.credit_limit,
         credit_used: user.open_credit_used,
-    }))
+    };
+    drop(d);
+    Ok(Json(result))
 }
 
 // ── Tags ──
 
 async fn list_tags(State(state): State<AppState>) -> Result<Json<Vec<String>>, AppError> {
-    let tags = state.store.tags.read().await;
-    Ok(Json(tags.clone()))
+    let tags = state.store.data.read().tags.clone();
+    Ok(Json(tags))
 }
 
 // ── Campaigns ──
@@ -804,10 +802,10 @@ async fn list_campaigns(
             for p in &parts {
                 if !seen.insert(p.clone()) { return Err(AppError::BadRequest); }
             }
-            let tag_map = state.store.tag_id_by_name.read().await;
+            let d = state.store.data.read();
             let mut ids = Vec::new();
             for p in &parts {
-                ids.push(tag_map.get(p).ok_or(AppError::BadRequest)?.clone());
+                ids.push(d.tag_id_by_name.get(p).ok_or(AppError::BadRequest)?.clone());
             }
             ids
         }
@@ -824,22 +822,20 @@ async fn list_campaigns(
     let cache_key = format!("sort={sort_mode};tags={}", tag_ids.join(","));
 
     // Check cache
-    if let Some(body) = state.store.list_cache.read().await.get(&cache_key).cloned() {
+    if let Some(body) = state.store.list_cache.read().get(&cache_key).cloned() {
         return Ok(response_from_json_bytes(body));
     }
 
     // Cache miss: compute just this key
-    let filter_tag_names: Vec<String> = {
-        let tag_name_map = state.store.tag_name_by_id.read().await;
-        tag_ids.iter().filter_map(|id| tag_name_map.get(id).cloned()).collect()
-    };
-    let campaigns = state.store.campaigns.read().await;
-    let mut open: Vec<CampaignRes> = campaigns.iter()
+    let d = state.store.data.read();
+    let filter_tag_names: Vec<String> =
+        tag_ids.iter().filter_map(|id| d.tag_name_by_id.get(id).cloned()).collect();
+    let mut open: Vec<CampaignRes> = d.campaigns.iter()
         .filter(|(_, c)| c.status == "open")
         .filter(|(_, c)| filter_tag_names.iter().all(|tag| c.tags.contains(tag)))
         .map(|(id, c)| c.to_response(id))
         .collect();
-    drop(campaigns);
+    drop(d);
     if sort_mode == "active" {
         open.sort_by(|a, b| {
             let ak = a.last_joined_at.unwrap_or(a.created_at);
@@ -851,7 +847,7 @@ async fn list_campaigns(
     }
     open.truncate(30);
     let bytes = Arc::new(serde_json::to_vec(&open).unwrap_or_default());
-    state.store.list_cache.write().await.insert(cache_key, bytes.clone());
+    state.store.list_cache.write().insert(cache_key, bytes.clone());
     Ok(response_from_json_bytes(bytes))
 }
 
@@ -861,16 +857,16 @@ async fn get_campaign(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, AppError> {
     // Check pre-serialized cache
-    if let Some(body) = state.store.campaign_json_cache.read().await.get(&id) {
-        return Ok(response_from_json_bytes(body.clone()));
+    if let Some(body) = state.store.campaign_json_cache.read().get(&id).cloned() {
+        return Ok(response_from_json_bytes(body));
     }
-    let campaigns = state.store.campaigns.read().await;
-    let camp = campaigns.get(&id).ok_or(AppError::NotFound)?;
+    let d = state.store.data.read();
+    let camp = d.campaigns.get(&id).ok_or(AppError::NotFound)?;
     let res = camp.to_response(&id);
-    drop(campaigns);
+    drop(d);
     let bytes = serde_json::to_vec(&res).map_err(|e| AppError::Internal(format!("json: {e}")))?;
     let body = Arc::new(bytes);
-    state.store.campaign_json_cache.write().await.insert(id, body.clone());
+    state.store.campaign_json_cache.write().insert(id, body.clone());
     Ok(response_from_json_bytes(body))
 }
 
@@ -962,14 +958,16 @@ async fn create_campaign(
     }
     let image_bytes = validate_jpeg_image_b64(&req.image)?;
 
-    let tag_map = state.store.tag_id_by_name.read().await;
-    let mut tag_ids = Vec::new();
-    for t in &req.tags {
-        let tid = tag_map.get(t).ok_or(AppError::BadRequest)?;
-        if tag_ids.contains(tid) { return Err(AppError::BadRequest); }
-        tag_ids.push(tid.clone());
-    }
-    drop(tag_map);
+    let tag_ids = {
+        let d = state.store.data.read();
+        let mut tag_ids = Vec::new();
+        for t in &req.tags {
+            let tid = d.tag_id_by_name.get(t).ok_or(AppError::BadRequest)?;
+            if tag_ids.contains(tid) { return Err(AppError::BadRequest); }
+            tag_ids.push(tid.clone());
+        }
+        tag_ids
+    };
 
     let id = Uuid::new_v4().to_string();
     let now = now_naive();
@@ -1000,18 +998,15 @@ async fn create_campaign(
     let res = camp.to_response(&id);
     let camp_clone = camp.clone();
 
-    let _guard = state.store.write_lock.lock().await;
-    state.store.campaigns.write().await.insert(id.clone(), camp);
-    drop(_guard);
+    state.store.data.write().campaigns.insert(id.clone(), camp);
 
-    state.store.invalidate_campaign(&id, &camp_clone).await;
+    state.store.invalidate_campaign(&id, &camp_clone);
 
     let event = SyncEvent::CampaignCreated {
         id: id.clone(), name: camp_clone.name, description: camp_clone.description,
         price: camp_clone.price, goal_count: camp_clone.goal_count,
         created_at: camp_clone.created_at, tags: camp_clone.tags, tag_ids: camp_clone.tag_ids,
     };
-    let st = state.clone();
     broadcast_sync(&state, &event).await;
 
     let image = write_campaign_image_file(&state, &id, &image_bytes).await?;
@@ -1034,87 +1029,110 @@ async fn join_campaign(
     let user_id_s = user_id;
     let now = now_naive();
 
-    let _guard = state.store.write_lock.lock().await;
-    let mut campaigns = state.store.campaigns.write().await;
-    let mut users = state.store.users.write().await;
+    // All data mutations in a single scoped write lock — no .await inside
+    let (response, response_bytes, webhook_url, webhook_user_ids, user_name,
+         after, goal_count, price, new_charges_sync) = {
+        let mut d = state.store.data.write();
 
-    let camp = campaigns.get(&campaign_id).ok_or(AppError::NotFound)?;
-    let user = users.get(&user_id_s).ok_or(AppError::Unauthorized)?;
+        // Phase 1: Validation (immutable borrows, all dropped at end of phase)
+        let price;
+        let goal_count;
+        let camp_tag_ids: HashSet<String>;
+        let user_name;
+        {
+            let camp = d.campaigns.get(&campaign_id).ok_or(AppError::NotFound)?;
+            let user = d.users.get(&user_id_s).ok_or(AppError::Unauthorized)?;
 
-    if camp.current_count() >= camp.goal_count { return Err(AppError::Conflict); }
-    if camp.participant_user_ids.contains(&user_id_s) { return Err(AppError::Conflict); }
-    if user.open_credit_used + camp.price > user.credit_limit {
-        return Err(AppError::PaymentRequired);
-    }
+            if camp.current_count() >= camp.goal_count { return Err(AppError::Conflict); }
+            if camp.participant_user_ids.contains(&user_id_s) { return Err(AppError::Conflict); }
+            if user.open_credit_used + camp.price > user.credit_limit {
+                return Err(AppError::PaymentRequired);
+            }
 
-    let price = camp.price;
-    let goal_count = camp.goal_count;
-    let camp_tag_ids: HashSet<String> = camp.tag_ids.iter().cloned().collect();
+            price = camp.price;
+            goal_count = camp.goal_count;
+            camp_tag_ids = camp.tag_ids.iter().cloned().collect();
+            user_name = user.name.clone();
+        }
 
-    // Add participant
-    let camp = campaigns.get_mut(&campaign_id).unwrap();
-    camp.participants.push(ParticipantRes {
-        user_id: user_id_s.clone(), name: user.name.clone(), joined_at: now,
-    });
-    camp.participant_user_ids.insert(user_id_s.clone());
-    camp.last_joined_at = Some(now);
+        // Phase 2: Add participant (mutable borrow of campaigns only)
+        let after;
+        {
+            let camp = d.campaigns.get_mut(&campaign_id).unwrap();
+            camp.participants.push(ParticipantRes {
+                user_id: user_id_s.clone(), name: user_name.clone(), joined_at: now,
+            });
+            camp.participant_user_ids.insert(user_id_s.clone());
+            camp.last_joined_at = Some(now);
+            after = camp.current_count();
+        }
 
-    let user = users.get_mut(&user_id_s).unwrap();
-    user.open_credit_used += price;
+        // Phase 3: Update joining user's credit
+        d.users.get_mut(&user_id_s).unwrap().open_credit_used += price;
 
-    let after = camp.current_count();
-
-    // Notification check (before potential close)
-    let mut webhook_user_ids: Vec<String> = Vec::new();
-    if after == goal_count - 1 {
-        let ss = state.store.saved_searches.read().await;
-        let mut seen = HashSet::new();
-        for (uid, searches) in ss.iter() {
-            for search in searches {
-                if search.tag_ids.iter().all(|tid| camp_tag_ids.contains(tid)) {
-                    if seen.insert(uid.clone()) {
-                        webhook_user_ids.push(uid.clone());
+        // Phase 4: Notification check (immutable borrow of saved_searches only)
+        let mut webhook_user_ids: Vec<String> = Vec::new();
+        if after == goal_count - 1 {
+            let mut seen = HashSet::new();
+            for (uid, searches) in d.saved_searches.iter() {
+                for search in searches {
+                    if search.tag_ids.iter().all(|tid| camp_tag_ids.contains(tid)) {
+                        if seen.insert(uid.clone()) {
+                            webhook_user_ids.push(uid.clone());
+                        }
                     }
                 }
             }
         }
-    }
 
-    // Campaign close
-    if after == goal_count {
-        camp.status = "closed".to_string();
-        let participant_uids: Vec<String> = camp.participant_user_ids.iter().cloned().collect();
-        let camp_name = camp.name.clone();
-        let mut charges = state.store.charges.write().await;
-        for uid in &participant_uids {
-            if let Some(u) = users.get_mut(uid) {
-                u.open_credit_used -= price;
-            }
-            let charge = ChargeEntry {
-                id: Uuid::new_v4().to_string(),
-                amount: price,
-                campaign_id: campaign_id.clone(),
-                campaign_name: camp_name.clone(),
-                campaign_price: price,
-                created_at: now,
+        // Phase 5: Campaign close
+        let mut new_charges_sync: Vec<SyncCharge> = Vec::new();
+        if after == goal_count {
+            // Get participant_uids and camp_name from campaign, then drop borrow
+            let (participant_uids, camp_name) = {
+                let camp = d.campaigns.get_mut(&campaign_id).unwrap();
+                camp.status = "closed".to_string();
+                let uids: Vec<String> = camp.participant_user_ids.iter().cloned().collect();
+                let name = camp.name.clone();
+                (uids, name)
             };
-            charges.entry(uid.clone()).or_default().insert(0, charge);
+            // Now camp borrow is dropped — can access users and charges freely
+            for uid in &participant_uids {
+                if let Some(u) = d.users.get_mut(uid) {
+                    u.open_credit_used -= price;
+                }
+                let charge = ChargeEntry {
+                    id: Uuid::new_v4().to_string(),
+                    amount: price,
+                    campaign_id: campaign_id.clone(),
+                    campaign_name: camp_name.clone(),
+                    campaign_price: price,
+                    created_at: now,
+                };
+                new_charges_sync.push(SyncCharge {
+                    user_id: uid.clone(), charge_id: charge.id.clone(),
+                    campaign_id: charge.campaign_id.clone(), campaign_name: charge.campaign_name.clone(),
+                    campaign_price: charge.campaign_price, created_at: charge.created_at,
+                });
+                d.charges.entry(uid.clone()).or_default().insert(0, charge);
+            }
         }
-    }
 
-    let response = camp.to_response(&campaign_id);
-    let response_bytes = Arc::new(serde_json::to_vec(&response)
-        .map_err(|e| AppError::Internal(format!("json: {e}")))?);
-    let webhook_url = state.store.webhook_url.read().await.clone();
+        // Phase 6: Build response (immutable borrow)
+        let camp = d.campaigns.get(&campaign_id).unwrap();
+        let response = camp.to_response(&campaign_id);
+        let response_bytes = Arc::new(serde_json::to_vec(&response)
+            .map_err(|e| AppError::Internal(format!("json: {e}")))?);
+        let webhook_url = d.webhook_url.clone();
 
-    drop(campaigns);
-    drop(users);
-    drop(_guard);
+        (response, response_bytes, webhook_url, webhook_user_ids, user_name,
+         after, goal_count, price, new_charges_sync)
+    }; // d dropped here — BEFORE any .await
 
-    // Update caches (outside write_lock) — reuse serialized bytes
-    state.store.campaign_json_cache.write().await
+    // Update caches — reuse serialized bytes
+    state.store.campaign_json_cache.write()
         .insert(campaign_id.clone(), response_bytes.clone());
-    state.store.list_cache.write().await.clear();
+    state.store.list_cache.write().clear();
 
     // Sync to replicas
     {
@@ -1122,22 +1140,12 @@ async fn join_campaign(
         let close_ids: Vec<String> = if closed {
             response.participants.iter().map(|p| p.user_id.clone()).collect()
         } else { Vec::new() };
-        let new_charges: Vec<SyncCharge> = if closed {
-            let charges = state.store.charges.read().await;
-            close_ids.iter().filter_map(|uid| {
-                charges.get(uid).and_then(|cs| cs.first()).map(|c| SyncCharge {
-                    user_id: uid.clone(), charge_id: c.id.clone(),
-                    campaign_id: c.campaign_id.clone(), campaign_name: c.campaign_name.clone(),
-                    campaign_price: c.campaign_price, created_at: c.created_at,
-                })
-            }).collect()
-        } else { Vec::new() };
 
         let event = SyncEvent::CampaignJoined {
             campaign_id: campaign_id.clone(), user_id: user_id_s.clone(),
-            user_name: { state.store.users.read().await.get(&user_id_s).map(|u| u.name.clone()).unwrap_or_default() },
+            user_name,
             joined_at: now, price, closed,
-            close_participant_ids: close_ids, new_charges,
+            close_participant_ids: close_ids, new_charges: new_charges_sync,
         };
         broadcast_sync(&state, &event).await;
     }
@@ -1204,24 +1212,23 @@ async fn create_saved_search(
         if !seen_names.insert(t.clone()) { return Err(AppError::BadRequest); }
     }
 
-    let tag_map = state.store.tag_id_by_name.read().await;
-    let mut tag_ids = HashSet::new();
-    let mut tag_id_vec = Vec::new();
-    for t in &req.tags {
-        let tid = tag_map.get(t).ok_or(AppError::BadRequest)?;
-        if !tag_ids.insert(tid.clone()) { return Err(AppError::BadRequest); }
-        tag_id_vec.push(tid.clone());
-    }
-    drop(tag_map);
-
     let user_id_s = user_id;
-    let _guard = state.store.write_lock.lock().await;
-    let mut ss = state.store.saved_searches.write().await;
-    let user_searches = ss.entry(user_id_s.clone()).or_default();
-    if user_searches.len() >= 10 { return Err(AppError::Conflict); }
-    user_searches.push(MemSavedSearch { tag_ids });
-    drop(ss);
-    drop(_guard);
+
+    let tag_id_vec;
+    {
+        let mut d = state.store.data.write();
+        let mut tag_ids = HashSet::new();
+        let mut ids = Vec::new();
+        for t in &req.tags {
+            let tid = d.tag_id_by_name.get(t).ok_or(AppError::BadRequest)?;
+            if !tag_ids.insert(tid.clone()) { return Err(AppError::BadRequest); }
+            ids.push(tid.clone());
+        }
+        let user_searches = d.saved_searches.entry(user_id_s.clone()).or_default();
+        if user_searches.len() >= 10 { return Err(AppError::Conflict); }
+        user_searches.push(MemSavedSearch { tag_ids });
+        tag_id_vec = ids;
+    }
 
     // Synchronous DB write (for persistence / 追試)
     let ss_id = Uuid::new_v4().to_string();
@@ -1241,7 +1248,6 @@ async fn create_saved_search(
     let event = SyncEvent::SavedSearchCreated {
         user_id: user_id_s, tag_ids: tag_id_vec.into_iter().collect(),
     };
-    let st = state.clone();
     broadcast_sync(&state, &event).await;
 
     Ok(StatusCode::CREATED)
@@ -1254,8 +1260,9 @@ async fn list_charges(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Json<Vec<ChargeRes>>, AppError> {
     let user_id_s = user_id;
-    let charges = state.store.charges.read().await;
-    let user_charges = charges.get(&user_id_s).cloned().unwrap_or_default();
+    let d = state.store.data.read();
+    let user_charges = d.charges.get(&user_id_s).cloned().unwrap_or_default();
+    drop(d);
     let res: Vec<ChargeRes> = user_charges.into_iter().map(|c| ChargeRes {
         id: c.id, amount: c.amount,
         campaign: ChargeCampaign { id: c.campaign_id, name: c.campaign_name, price: c.campaign_price },
@@ -1282,8 +1289,7 @@ async fn apply_sync_event(state: &AppState, event: SyncEvent) -> Result<(), AppE
             state.store.load_from_db(&state.pool).await?;
         }
         SyncEvent::UserCreated { id, name, credit_limit } => {
-            let _g = state.store.write_lock.lock().await;
-            state.store.users.write().await.insert(id, MemUser {
+            state.store.data.write().users.insert(id, MemUser {
                 name, credit_limit, open_credit_used: 0,
             });
         }
@@ -1293,60 +1299,66 @@ async fn apply_sync_event(state: &AppState, event: SyncEvent) -> Result<(), AppE
                 participants: Vec::new(), participant_user_ids: HashSet::new(),
                 status: "open".to_string(), last_joined_at: None,
             };
-            let _g = state.store.write_lock.lock().await;
-            state.store.invalidate_campaign(&id, &camp).await;
-            state.store.campaigns.write().await.insert(id, camp);
+            state.store.invalidate_campaign(&id, &camp);
+            state.store.data.write().campaigns.insert(id, camp);
         }
         SyncEvent::CampaignJoined {
             campaign_id, user_id, user_name, joined_at, price,
             closed, close_participant_ids, new_charges,
         } => {
-            let _g = state.store.write_lock.lock().await;
-            let mut campaigns = state.store.campaigns.write().await;
-            let mut users = state.store.users.write().await;
+            let camp_clone = {
+                let mut d = state.store.data.write();
 
-            if let Some(camp) = campaigns.get_mut(&campaign_id) {
-                if !camp.participant_user_ids.contains(&user_id) {
-                    camp.participants.push(ParticipantRes {
-                        user_id: user_id.clone(), name: user_name, joined_at,
-                    });
-                    camp.participant_user_ids.insert(user_id.clone());
-                    camp.last_joined_at = Some(joined_at);
-                    if let Some(u) = users.get_mut(&user_id) {
+                // Phase 1: Add participant (mutable borrow of campaigns)
+                let mut need_credit_add = false;
+                {
+                    if let Some(camp) = d.campaigns.get_mut(&campaign_id) {
+                        if !camp.participant_user_ids.contains(&user_id) {
+                            camp.participants.push(ParticipantRes {
+                                user_id: user_id.clone(), name: user_name, joined_at,
+                            });
+                            camp.participant_user_ids.insert(user_id.clone());
+                            camp.last_joined_at = Some(joined_at);
+                            need_credit_add = true;
+                        }
+                        if closed {
+                            camp.status = "closed".to_string();
+                        }
+                    }
+                }
+
+                // Phase 2: Update user credits (mutable borrow of users)
+                if need_credit_add {
+                    if let Some(u) = d.users.get_mut(&user_id) {
                         u.open_credit_used += price;
                     }
                 }
                 if closed {
-                    camp.status = "closed".to_string();
                     for uid in &close_participant_ids {
-                        if let Some(u) = users.get_mut(uid) {
+                        if let Some(u) = d.users.get_mut(uid) {
                             u.open_credit_used -= price;
                         }
                     }
                 }
-            }
 
-            if !new_charges.is_empty() {
-                let mut charges = state.store.charges.write().await;
+                // Phase 3: Add charges
                 for sc in new_charges {
-                    charges.entry(sc.user_id).or_default().insert(0, ChargeEntry {
+                    d.charges.entry(sc.user_id).or_default().insert(0, ChargeEntry {
                         id: sc.charge_id, amount: sc.campaign_price,
                         campaign_id: sc.campaign_id, campaign_name: sc.campaign_name,
                         campaign_price: sc.campaign_price, created_at: sc.created_at,
                     });
                 }
-            }
 
-            if let Some(camp) = campaigns.get(&campaign_id) {
-                let camp_clone = camp.clone();
-                drop(campaigns);
-                drop(users);
-                state.store.invalidate_campaign(&campaign_id, &camp_clone).await;
+                d.campaigns.get(&campaign_id).cloned()
+            };
+
+            if let Some(camp) = camp_clone {
+                state.store.invalidate_campaign(&campaign_id, &camp);
             }
         }
         SyncEvent::SavedSearchCreated { user_id, tag_ids } => {
-            let _g = state.store.write_lock.lock().await;
-            state.store.saved_searches.write().await
+            state.store.data.write().saved_searches
                 .entry(user_id).or_default()
                 .push(MemSavedSearch { tag_ids: tag_ids.into_iter().collect() });
         }
