@@ -98,9 +98,8 @@ struct Store {
     campaign_image: tokio::sync::RwLock<HashMap<String, ImageCache>>,
     // Pre-computed list responses (rebuilt on join/create, not on every list request)
     list_cache_dirty: parking_lot::RwLock<bool>,
-    list_cache: parking_lot::RwLock<HashMap<String, Bytes>>,
-    // Pre-serialized campaign responses
-    campaign_json_cache: parking_lot::RwLock<HashMap<String, Bytes>>,
+    list_cache: parking_lot::RwLock<HashMap<String, CachedJson>>,
+    campaign_json_cache: parking_lot::RwLock<HashMap<String, CachedJson>>,
 }
 
 struct StoreData {
@@ -112,7 +111,7 @@ struct StoreData {
     saved_searches: HashMap<String, Vec<MemSavedSearch>>,
     charges: HashMap<String, Vec<ChargeEntry>>,
     webhook_url: String,
-    me_cache: HashMap<String, Bytes>,
+    me_cache: HashMap<String, CachedJson>,
 }
 
 #[derive(Clone)]
@@ -450,8 +449,8 @@ impl Store {
             tag_ids.sort();
             let tag_key = tag_ids.join(",");
 
-            cache.insert(format!("sort=new;tags={tag_key}"), json_to_gzip(&by_new));
-            cache.insert(format!("sort=active;tags={tag_key}"), json_to_gzip(&by_active));
+            cache.insert(format!("sort=new;tags={tag_key}"), json_to_cached(&by_new));
+            cache.insert(format!("sort=active;tags={tag_key}"), json_to_cached(&by_active));
         }
 
         drop(d);
@@ -461,7 +460,7 @@ impl Store {
     }
 
     fn invalidate_campaign(&self, campaign_id: &str, camp: &MemCampaign) {
-        let bytes = json_to_gzip(&camp.to_response(campaign_id));
+        let bytes = json_to_cached(&camp.to_response(campaign_id));
         self.campaign_json_cache.write()
             .insert(campaign_id.to_string(), bytes);
         self.list_cache.write().clear();
@@ -867,7 +866,7 @@ async fn get_me(
     {
         let d = state.store.data.read();
         if let Some(cached) = d.me_cache.get(&user_id_s) {
-            return Ok(respond_cached_json(cached.clone(), &headers));
+            return Ok(respond_cached_json(&cached, &headers));
         }
     }
     // Cache miss: build and store
@@ -880,9 +879,9 @@ async fn get_me(
         credit_used: user.open_credit_used,
     };
     drop(d);
-    let bytes = json_to_gzip(&result);
+    let bytes = json_to_cached(&result);
     state.store.data.write().me_cache.insert(user_id_s, bytes.clone());
-    Ok(respond_cached_json(bytes, &headers))
+    Ok(respond_cached_json(&bytes, &headers))
 }
 
 // ── Tags ──
@@ -906,11 +905,6 @@ fn gzip_compress(data: &[u8]) -> Bytes {
     Bytes::from(encoder.finish().unwrap())
 }
 
-fn json_to_gzip(data: &impl Serialize) -> Bytes {
-    let raw = serde_json::to_vec(data).unwrap_or_default();
-    gzip_compress(&raw)
-}
-
 fn accepts_gzip(headers: &HeaderMap) -> bool {
     headers.get(header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
@@ -918,21 +912,28 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn respond_cached_json(gzipped: Bytes, headers: &HeaderMap) -> Response {
+#[derive(Clone)]
+struct CachedJson {
+    raw: Bytes,
+    gzip: Bytes,
+}
+
+fn respond_cached_json(cached: &CachedJson, headers: &HeaderMap) -> Response {
     if accepts_gzip(headers) {
         (StatusCode::OK, [
             (header::CONTENT_TYPE, "application/json"),
             (header::CONTENT_ENCODING, "gzip"),
-        ], Body::from(gzipped)).into_response()
+        ], Body::from(cached.gzip.clone())).into_response()
     } else {
-        use flate2::read::GzDecoder;
-        use std::io::Read;
-        let mut decoder = GzDecoder::new(gzipped.as_ref());
-        let mut raw = Vec::new();
-        let _ = decoder.read_to_end(&mut raw);
         (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")],
-         Body::from(raw)).into_response()
+         Body::from(cached.raw.clone())).into_response()
     }
+}
+
+fn json_to_cached(data: &impl Serialize) -> CachedJson {
+    let raw = Bytes::from(serde_json::to_vec(data).unwrap_or_default());
+    let gzip = gzip_compress(&raw);
+    CachedJson { raw, gzip }
 }
 
 fn response_from_json_bytes(body: Bytes) -> Response {
@@ -974,7 +975,7 @@ async fn list_campaigns(
 
     // Check cache
     if let Some(body) = state.store.list_cache.read().get(&cache_key).cloned() {
-        return Ok(respond_cached_json(body, &headers));
+        return Ok(respond_cached_json(&body, &headers));
     }
 
     // Cache miss: compute just this key
@@ -997,9 +998,9 @@ async fn list_campaigns(
         open.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     }
     open.truncate(30);
-    let bytes = json_to_gzip(&open);
+    let bytes = json_to_cached(&open);
     state.store.list_cache.write().insert(cache_key, bytes.clone());
-    Ok(respond_cached_json(bytes, &headers))
+    Ok(respond_cached_json(&bytes, &headers))
 }
 
 async fn get_campaign(
@@ -1010,15 +1011,15 @@ async fn get_campaign(
 ) -> Result<Response, AppError> {
     // Check pre-serialized cache
     if let Some(body) = state.store.campaign_json_cache.read().get(&id).cloned() {
-        return Ok(respond_cached_json(body, &headers));
+        return Ok(respond_cached_json(&body, &headers));
     }
     let d = state.store.data.read();
     let camp = d.campaigns.get(&id).ok_or(AppError::NotFound)?;
     let res = camp.to_response(&id);
     drop(d);
-    let body = json_to_gzip(&res);
+    let body = json_to_cached(&res);
     state.store.campaign_json_cache.write().insert(id, body.clone());
-    Ok(respond_cached_json(body, &headers))
+    Ok(respond_cached_json(&body, &headers))
 }
 
 // ── Campaign image ──
@@ -1252,7 +1253,7 @@ async fn join_campaign(
 
         let camp = d.campaigns.get(&campaign_id).unwrap();
         let response = camp.to_response(&campaign_id);
-        let response_bytes = json_to_gzip(&response);
+        let response_bytes = json_to_cached(&response);
         let webhook_url = d.webhook_url.clone();
         let new_charges_sync = Vec::<SyncCharge>::new();
 
@@ -1317,7 +1318,7 @@ async fn join_campaign(
         }
     }
 
-    Ok(respond_cached_json(response_bytes, &headers))
+    Ok(respond_cached_json(&response_bytes, &headers))
 }
 
 // ── Saved searches ──
