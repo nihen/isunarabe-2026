@@ -771,26 +771,28 @@ async fn warm_read_cache(state: &AppState) -> Result<(), AppError> {
         fetch_participants_by_campaign(&state.pool, &campaign_ids).await?;
 
     let mut campaigns = Vec::with_capacity(rows.len());
-    for (id, name, description, price, goal_count, created_at, current_count, last_joined_at) in
+    for (id, name, description, price, goal_count, created_at, _current_count, last_joined_at) in
         rows
     {
-        let status = if current_count as i32 >= goal_count {
+        let participants = participants_by_campaign
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        let current_count = participants.len() as i32;
+        let status = if current_count >= goal_count {
             "closed"
         } else {
             "open"
         };
         campaigns.push(CampaignRes {
             tags: tags_by_campaign.get(&id).cloned().unwrap_or_default(),
-            participants: participants_by_campaign
-                .get(&id)
-                .cloned()
-                .unwrap_or_default(),
+            participants,
             id,
             name,
             description,
             price,
             goal_count,
-            current_count: current_count as i32,
+            current_count,
             status: status.to_string(),
             created_at,
             last_joined_at,
