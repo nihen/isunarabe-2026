@@ -10,7 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
-tower-http = { version = "0.6", features = ["fs", "compression-gzip"] }
+tower-http = { version = "0.6", features = ["fs"] }
+flate2 = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "process", "time", "sync", "fs"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "mysql", "chrono", "uuid"] }
 serde = { version = "1", features = ["derive"] }
@@ -25,4 +26,4 @@ hex = "0.4"
 rand = "0.8"
 parking_lot = "0.12"
 bytes = "1"
-tikv-jemallocator = "0.6"
+# tikv-jemallocator = "0.6"
