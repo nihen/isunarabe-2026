@@ -524,7 +524,7 @@ async fn list_campaigns(
                 price,
                 goal_count,
                 created_at,
-                current_count,
+                _current_count,
                 last_joined_at,
             )| {
                 let tags = tags_by_campaign.get(&id).cloned().unwrap_or_default();
@@ -532,15 +532,16 @@ async fn list_campaigns(
                     .get(&id)
                     .cloned()
                     .unwrap_or_default();
+                let current_count = participants.len() as i32;
                 CampaignRes {
                     id,
                     name,
                     description,
                     price,
                     goal_count,
-                    current_count: current_count as i32,
+                    current_count,
                     tags,
-                    status: "open".to_string(),
+                    status: if current_count >= goal_count { "closed" } else { "open" }.to_string(),
                     created_at,
                     last_joined_at,
                     participants,
