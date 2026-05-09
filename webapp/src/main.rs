@@ -467,7 +467,7 @@ impl Store {
         let bytes = Bytes::from(serde_json::to_vec(&camp.to_response(campaign_id)).unwrap_or_default());
         self.campaign_json_cache.write()
             .insert(campaign_id.to_string(), bytes);
-        *self.list_cache_dirty.write() = true;
+        self.list_cache.write().clear();
     }
 }
 
