@@ -1,6 +1,3 @@
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 use axum::{
     body::Body,
     extract::{FromRequest, Path as AxumPath, Query as AxumQuery, Request, State},
