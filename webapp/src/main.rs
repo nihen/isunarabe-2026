@@ -920,36 +920,25 @@ async fn join_campaign(
     drop(users);
     drop(_guard);
 
-    // Async DB write-behind. Memory is source of truth; DB is for persistence (追試 restart).
-    {
-        let pool = state.pool.clone();
-        let cid = campaign_id.clone();
-        let uid = user_id_s.clone();
-        tokio::spawn(async move {
-            let r: Result<(), sqlx::Error> = async {
-                let participant_id = Uuid::new_v4().to_string();
-                let mut tx = pool.begin().await?;
-                sqlx::query(
-                    "INSERT INTO campaign_participants (id, campaign_id, user_id, created_at) VALUES (?, ?, ?, ?)",
-                ).bind(&participant_id).bind(&cid).bind(&uid).bind(now)
-                    .execute(&mut *tx).await?;
-                if after == goal_count {
-                    let parts: Vec<(String,)> = sqlx::query_as(
-                        "SELECT id FROM campaign_participants WHERE campaign_id = ?",
-                    ).bind(&cid).fetch_all(&mut *tx).await?;
-                    for (pid,) in parts {
-                        sqlx::query(
-                            "INSERT INTO charges (id, campaign_participant_id, created_at) VALUES (?, ?, ?)",
-                        ).bind(Uuid::new_v4().to_string()).bind(pid).bind(now)
-                            .execute(&mut *tx).await?;
-                    }
-                }
-                tx.commit().await?;
-                Ok(())
-            }.await;
-            if let Err(e) = r { eprintln!("join write-behind: {e}"); }
-        });
+    // Synchronous DB write (for persistence / 追試). Lock already released.
+    let participant_id = Uuid::new_v4().to_string();
+    let mut tx = state.pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO campaign_participants (id, campaign_id, user_id, created_at) VALUES (?, ?, ?, ?)",
+    ).bind(&participant_id).bind(&campaign_id).bind(&user_id_s).bind(now)
+        .execute(&mut *tx).await?;
+    if after == goal_count {
+        let parts: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM campaign_participants WHERE campaign_id = ?",
+        ).bind(&campaign_id).fetch_all(&mut *tx).await?;
+        for (pid,) in parts {
+            sqlx::query(
+                "INSERT INTO charges (id, campaign_participant_id, created_at) VALUES (?, ?, ?)",
+            ).bind(Uuid::new_v4().to_string()).bind(pid).bind(now)
+                .execute(&mut *tx).await?;
+        }
     }
+    tx.commit().await?;
 
     // Webhooks
     if !webhook_user_ids.is_empty() && !webhook_url.is_empty() {
@@ -1012,29 +1001,20 @@ async fn create_saved_search(
     drop(ss);
     drop(_guard);
 
-    // Async DB write-behind
-    {
-        let pool = state.pool.clone();
-        tokio::spawn(async move {
-            let r: Result<(), sqlx::Error> = async {
-                let ss_id = Uuid::new_v4().to_string();
-                let now = now_naive();
-                let mut tx = pool.begin().await?;
-                sqlx::query("INSERT INTO saved_searches (id, user_id, created_at) VALUES (?, ?, ?)")
-                    .bind(&ss_id).bind(&user_id_s).bind(now)
-                    .execute(&mut *tx).await?;
-                for tid in &tag_id_vec {
-                    sqlx::query(
-                        "INSERT INTO saved_search_tags (saved_search_id, tag_id, created_at) VALUES (?, ?, ?)",
-                    ).bind(&ss_id).bind(tid).bind(now)
-                        .execute(&mut *tx).await?;
-                }
-                tx.commit().await?;
-                Ok(())
-            }.await;
-            if let Err(e) = r { eprintln!("saved_search write-behind: {e}"); }
-        });
+    // Synchronous DB write (for persistence / 追試)
+    let ss_id = Uuid::new_v4().to_string();
+    let now = now_naive();
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("INSERT INTO saved_searches (id, user_id, created_at) VALUES (?, ?, ?)")
+        .bind(&ss_id).bind(&user_id_s).bind(now)
+        .execute(&mut *tx).await?;
+    for tid in &tag_id_vec {
+        sqlx::query(
+            "INSERT INTO saved_search_tags (saved_search_id, tag_id, created_at) VALUES (?, ?, ?)",
+        ).bind(&ss_id).bind(tid).bind(now)
+            .execute(&mut *tx).await?;
     }
+    tx.commit().await?;
 
     Ok(StatusCode::CREATED)
 }
