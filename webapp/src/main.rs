@@ -16,6 +16,7 @@ use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -55,6 +56,8 @@ use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 const DEFAULT_CREDIT_LIMIT: i32 = 60000;
+
+static LIST_CACHE_AGGRESSIVE: AtomicBool = AtomicBool::new(false);
 
 // ── AppState ──
 
@@ -114,7 +117,6 @@ struct Store {
 struct StoreData {
     users: HashMap<String, MemUser>,
     campaigns: HashMap<String, MemCampaign>,
-    tags: Vec<String>,
     tags_cache: Bytes,
     tag_id_by_name: HashMap<String, String>,
     tag_name_by_id: HashMap<String, String>,
@@ -139,7 +141,7 @@ struct MemCampaign {
     price: i32,
     goal_count: i32,
     created_at: NaiveDateTime,
-    created_at_str: Arc<str>,
+
     tags: Arc<[String]>,
     tag_ids: Vec<String>,
     participants: Vec<Arc<ParticipantRes>>,
@@ -153,17 +155,18 @@ impl MemCampaign {
         self.participants.len() as i32
     }
 
+    #[inline]
     fn to_response(&self, id: &str) -> CampaignRes {
         let cc = self.current_count();
         CampaignRes {
-            id: id.to_string(),
-            name: self.name.to_string(),
-            description: self.description.to_string(),
+            id: Arc::from(id),
+            name: self.name.clone(),
+            description: self.description.clone(),
             price: self.price,
             goal_count: self.goal_count,
             current_count: cc,
-            tags: self.tags.to_vec(),
-            status: if cc >= self.goal_count { "closed" } else { "open" }.to_string(),
+            tags: self.tags.clone(),
+            status: if cc >= self.goal_count { "closed" } else { "open" },
             created_at: self.created_at,
             last_joined_at: self.last_joined_at,
             participants: self.participants.clone(),
@@ -238,7 +241,6 @@ impl Store {
             data: parking_lot::RwLock::new(StoreData {
                 users: HashMap::new(),
                 campaigns: HashMap::new(),
-                tags: Vec::new(),
                 tags_cache: Bytes::new(),
                 tag_id_by_name: HashMap::new(),
                 tag_name_by_id: HashMap::new(),
@@ -288,7 +290,7 @@ impl Store {
         for (id, name, description, price, goal_count, created_at) in camp_rows {
             campaigns.insert(id, MemCampaign {
                 name: Arc::from(name.as_str()), description: Arc::from(description.as_str()),
-                price, goal_count, created_at, created_at_str: Arc::from(fmt_dt(created_at).as_str()),
+                price, goal_count, created_at,
                 tags: Arc::from(Vec::new().as_slice()), tag_ids: Vec::new(),
                 participants: Vec::new(), participant_user_ids: HashSet::new(),
                 status: "open".to_string(), last_joined_at: None,
@@ -408,7 +410,7 @@ impl Store {
 
         // Replace all data at once (single write lock)
         *self.data.write() = StoreData {
-            users, campaigns, tags, tags_cache, tag_id_by_name, tag_name_by_id,
+            users, campaigns, tags_cache, tag_id_by_name, tag_name_by_id,
             saved_searches, charges, charges_cache, webhook_url,
             me_cache: HashMap::new(),
         };
@@ -433,9 +435,8 @@ impl Store {
 
         let d = self.data.read();
 
-        let open: Vec<(String, &MemCampaign)> = d.campaigns.iter()
+        let open: Vec<(&String, &MemCampaign)> = d.campaigns.iter()
             .filter(|(_, c)| c.status == "open")
-            .map(|(id, c)| (id.clone(), c))
             .collect();
 
         let mut cache = HashMap::new();
@@ -456,24 +457,22 @@ impl Store {
         }
 
         for combo in &tag_combos {
-            let filtered: Vec<CampaignRes> = open.iter()
+            let mut refs: Vec<(&String, &MemCampaign)> = open.iter()
                 .filter(|(_, c)| combo.iter().all(|tag| c.tags.iter().any(|t| t == tag)))
-                .map(|(id, c)| c.to_response(id))
+                .copied()
                 .collect();
 
-            // sort=new
-            let mut by_new = filtered.clone();
-            by_new.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            by_new.truncate(30);
+            // sort=new: sort refs, truncate, then to_response top 30 only
+            refs.sort_by(|a, b| b.1.created_at.cmp(&a.1.created_at));
+            let by_new: Vec<CampaignRes> = refs.iter().take(30).map(|(id, c)| c.to_response(id)).collect();
 
-            // sort=active
-            let mut by_active = filtered;
-            by_active.sort_by(|a, b| {
-                let ak = a.last_joined_at.unwrap_or(a.created_at);
-                let bk = b.last_joined_at.unwrap_or(b.created_at);
+            // sort=active: re-sort same refs
+            refs.sort_by(|a, b| {
+                let ak = a.1.last_joined_at.unwrap_or(a.1.created_at);
+                let bk = b.1.last_joined_at.unwrap_or(b.1.created_at);
                 bk.cmp(&ak)
             });
-            by_active.truncate(30);
+            let by_active: Vec<CampaignRes> = refs.iter().take(30).map(|(id, c)| c.to_response(id)).collect();
 
             let mut tag_ids: Vec<&str> = combo.iter()
                 .filter_map(|name| d.tag_id_by_name.get(*name).map(|id| id.as_str()))
@@ -513,6 +512,11 @@ async fn main() {
         .connect(&dsn)
         .await
         .expect("connect to MySQL");
+
+    LIST_CACHE_AGGRESSIVE.store(
+        std::env::var("LIST_CACHE_AGGRESSIVE").map(|v| v == "1").unwrap_or(false),
+        Ordering::Relaxed,
+    );
 
     let sql_dir = std::env::var("SQL_DIR")
         .map(PathBuf::from)
@@ -811,8 +815,8 @@ fn validate_jpeg_image_b64(b64: &str) -> Result<Vec<u8>, AppError> {
 
 #[derive(Clone, Serialize)]
 struct CampaignRes {
-    id: String, name: String, description: String, price: i32,
-    goal_count: i32, current_count: i32, tags: Vec<String>, status: String,
+    id: Arc<str>, name: Arc<str>, description: Arc<str>, price: i32,
+    goal_count: i32, current_count: i32, tags: Arc<[String]>, status: &'static str,
     #[serde(serialize_with = "serialize_dt")]
     created_at: NaiveDateTime,
     #[serde(serialize_with = "serialize_dt_opt")]
@@ -945,26 +949,18 @@ async fn get_me(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Response, AppError> {
-    let user_id_s = user_id;
-    // Check me_cache first
-    {
-        let d = state.store.data.read();
-        if let Some(cached) = d.me_cache.get(&user_id_s) {
-            return Ok(response_from_json_bytes(cached.clone()));
-        }
-    }
-    // Cache miss: build and store
+    // Single read lock: check cache + build on miss
     let d = state.store.data.read();
-    let user = d.users.get(&user_id_s).ok_or(AppError::Unauthorized)?;
-    let result = MeRes {
-        id: user_id_s.clone(),
-        name: user.name.clone(),
-        credit_limit: user.credit_limit,
-        credit_used: user.open_credit_used,
-    };
+    if let Some(cached) = d.me_cache.get(&user_id) {
+        return Ok(response_from_json_bytes(cached.clone()));
+    }
+    let user = d.users.get(&user_id).ok_or(AppError::Unauthorized)?;
+    let bytes = Bytes::from(serde_json::to_vec(&MeRes {
+        id: user_id.clone(), name: user.name.clone(),
+        credit_limit: user.credit_limit, credit_used: user.open_credit_used,
+    }).map_err(|e| AppError::Internal(format!("json: {e}")))?);
     drop(d);
-    let bytes = Bytes::from(serde_json::to_vec(&result).map_err(|e| AppError::Internal(format!("json: {e}")))?);
-    state.store.data.write().me_cache.insert(user_id_s, bytes.clone());
+    state.store.data.write().me_cache.insert(user_id, bytes.clone());
     Ok(response_from_json_bytes(bytes))
 }
 
@@ -1174,7 +1170,6 @@ async fn create_campaign(
     let camp = MemCampaign {
         name: Arc::from(req.name.as_str()), description: Arc::from(req.description.as_str()),
         price: req.price, goal_count: req.goal_count, created_at: now,
-        created_at_str: Arc::from(fmt_dt(now).as_str()),
         tags: Arc::from(req.tags.as_slice()), tag_ids,
         participants: Vec::new(), participant_user_ids: HashSet::new(),
         status: "open".to_string(), last_joined_at: None,
@@ -1309,10 +1304,7 @@ async fn join_campaign(
     // Update caches — reuse serialized bytes
     state.store.campaign_json_cache.write()
         .insert(campaign_id.clone(), response_bytes.clone());
-    // LIST_CACHE_AGGRESSIVE=1: only clear on close (faster, slightly stale)
-    // unset: clear on every join (safe)
-    let aggressive = std::env::var("LIST_CACHE_AGGRESSIVE").map(|v| v == "1").unwrap_or(false);
-    if !aggressive || after == goal_count {
+    if !LIST_CACHE_AGGRESSIVE.load(Ordering::Relaxed) || after == goal_count {
         state.store.list_cache.write().clear();
     }
 
@@ -1476,7 +1468,7 @@ async fn apply_sync_event(state: &AppState, event: SyncEvent) -> Result<(), AppE
         SyncEvent::CampaignCreated { id, name, description, price, goal_count, created_at, tags, tag_ids } => {
             let camp = MemCampaign {
                 name: Arc::from(name.as_str()), description: Arc::from(description.as_str()),
-                price, goal_count, created_at, created_at_str: Arc::from(fmt_dt(created_at).as_str()),
+                price, goal_count, created_at,
                 tags: Arc::from(tags.as_slice()), tag_ids,
                 participants: Vec::new(), participant_user_ids: HashSet::new(),
                 status: "open".to_string(), last_joined_at: None,
