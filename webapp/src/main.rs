@@ -10,19 +10,20 @@ use axum::{
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::Digest as _;
-use sqlx::mysql::{MySql, MySqlPool, MySqlPoolOptions};
-use sqlx::QueryBuilder;
+use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 const DEFAULT_CREDIT_LIMIT: i32 = 60000;
+
+// ── AppState ──
 
 #[derive(Clone)]
 struct AppState {
@@ -31,11 +32,11 @@ struct AppState {
     image_dir: PathBuf,
     seed_image_dir: PathBuf,
     db: Arc<DbConn>,
-    cache: Arc<AppCache>,
+    store: Arc<Store>,
     webhook_tx: mpsc::Sender<WebhookMessage>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct DbConn {
     host: String,
     port: u16,
@@ -53,14 +54,78 @@ struct WebhookMessage {
     body: serde_json::Value,
 }
 
-#[derive(Default)]
-struct AppCache {
-    tags_json: RwLock<Option<Arc<Vec<u8>>>>,
-    campaign_json: RwLock<HashMap<String, Arc<Vec<u8>>>>,
+// ── In-memory store ──
+
+struct Store {
+    users: RwLock<HashMap<String, MemUser>>,
+    campaigns: RwLock<HashMap<String, MemCampaign>>,
+    tags: RwLock<Vec<String>>,
+    tag_id_by_name: RwLock<HashMap<String, String>>,
+    tag_name_by_id: RwLock<HashMap<String, String>>,
+    saved_searches: RwLock<HashMap<String, Vec<MemSavedSearch>>>,
+    charges: RwLock<HashMap<String, Vec<ChargeEntry>>>,
+    webhook_url: RwLock<String>,
     campaign_image: RwLock<HashMap<String, ImageCache>>,
-    list_campaigns_json: RwLock<HashMap<String, Arc<Vec<u8>>>>,
-    me_json: RwLock<HashMap<String, Arc<Vec<u8>>>>,
-    charges_json: RwLock<HashMap<String, Arc<Vec<u8>>>>,
+    write_lock: Mutex<()>,
+}
+
+#[derive(Clone)]
+struct MemUser {
+    name: String,
+    credit_limit: i32,
+    open_credit_used: i32,
+}
+
+#[derive(Clone)]
+struct MemCampaign {
+    name: String,
+    description: String,
+    price: i32,
+    goal_count: i32,
+    created_at: NaiveDateTime,
+    tags: Vec<String>,
+    tag_ids: Vec<String>,
+    participants: Vec<ParticipantRes>,
+    participant_user_ids: HashSet<String>,
+    status: String,
+    last_joined_at: Option<NaiveDateTime>,
+}
+
+impl MemCampaign {
+    fn current_count(&self) -> i32 {
+        self.participants.len() as i32
+    }
+
+    fn to_response(&self, id: &str) -> CampaignRes {
+        CampaignRes {
+            id: id.to_string(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            price: self.price,
+            goal_count: self.goal_count,
+            current_count: self.current_count(),
+            tags: self.tags.clone(),
+            status: self.status.clone(),
+            created_at: self.created_at,
+            last_joined_at: self.last_joined_at,
+            participants: self.participants.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MemSavedSearch {
+    tag_ids: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct ChargeEntry {
+    id: String,
+    amount: i32,
+    campaign_id: String,
+    campaign_name: String,
+    campaign_price: i32,
+    created_at: NaiveDateTime,
 }
 
 #[derive(Clone)]
@@ -69,40 +134,172 @@ struct ImageCache {
     etag: String,
 }
 
-impl AppCache {
-    async fn clear_all(&self) {
-        *self.tags_json.write().await = None;
-        self.campaign_json.write().await.clear();
-        self.campaign_image.write().await.clear();
-        self.list_campaigns_json.write().await.clear();
-        self.me_json.write().await.clear();
-        self.charges_json.write().await.clear();
-    }
-
-    async fn clear_list_campaigns(&self) {
-        self.list_campaigns_json.write().await.clear();
-    }
-
-    async fn clear_users<'a, I>(&self, user_ids: I)
-    where
-        I: IntoIterator<Item = &'a str>,
-    {
-        let mut me_json = self.me_json.write().await;
-        let mut charges_json = self.charges_json.write().await;
-        for user_id in user_ids {
-            me_json.remove(user_id);
-            charges_json.remove(user_id);
+impl Store {
+    fn new() -> Self {
+        Store {
+            users: RwLock::new(HashMap::new()),
+            campaigns: RwLock::new(HashMap::new()),
+            tags: RwLock::new(Vec::new()),
+            tag_id_by_name: RwLock::new(HashMap::new()),
+            tag_name_by_id: RwLock::new(HashMap::new()),
+            saved_searches: RwLock::new(HashMap::new()),
+            charges: RwLock::new(HashMap::new()),
+            webhook_url: RwLock::new(String::new()),
+            campaign_image: RwLock::new(HashMap::new()),
+            write_lock: Mutex::new(()),
         }
     }
+
+    async fn load_from_db(&self, pool: &MySqlPool) -> Result<(), AppError> {
+        // Tags
+        let tag_rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, name FROM tags").fetch_all(pool).await?;
+        let mut tags = Vec::new();
+        let mut tag_id_by_name = HashMap::new();
+        let mut tag_name_by_id = HashMap::new();
+        for (id, name) in tag_rows {
+            tags.push(name.clone());
+            tag_id_by_name.insert(name.clone(), id.clone());
+            tag_name_by_id.insert(id, name);
+        }
+        *self.tags.write().await = tags;
+        *self.tag_id_by_name.write().await = tag_id_by_name;
+        *self.tag_name_by_id.write().await = tag_name_by_id;
+
+        // Users
+        let user_rows: Vec<(String, String, i32)> =
+            sqlx::query_as("SELECT id, name, credit_limit FROM users")
+                .fetch_all(pool).await?;
+        let mut users = HashMap::with_capacity(user_rows.len());
+        for (id, name, credit_limit) in user_rows {
+            users.insert(id, MemUser { name, credit_limit, open_credit_used: 0 });
+        }
+
+        // Campaigns (without image)
+        let camp_rows: Vec<(String, String, String, i32, i32, NaiveDateTime)> =
+            sqlx::query_as(
+                "SELECT id, name, description, price, goal_count, created_at FROM campaigns",
+            )
+            .fetch_all(pool).await?;
+        let mut campaigns: HashMap<String, MemCampaign> = HashMap::with_capacity(camp_rows.len());
+        for (id, name, description, price, goal_count, created_at) in camp_rows {
+            campaigns.insert(id, MemCampaign {
+                name, description, price, goal_count, created_at,
+                tags: Vec::new(), tag_ids: Vec::new(),
+                participants: Vec::new(), participant_user_ids: HashSet::new(),
+                status: "open".to_string(), last_joined_at: None,
+            });
+        }
+
+        // Campaign tags
+        let ct_rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT campaign_id, tag_id FROM campaign_tags")
+                .fetch_all(pool).await?;
+        let tag_name_map = self.tag_name_by_id.read().await;
+        for (cid, tid) in ct_rows {
+            if let Some(camp) = campaigns.get_mut(&cid) {
+                if let Some(name) = tag_name_map.get(&tid) {
+                    camp.tags.push(name.clone());
+                }
+                camp.tag_ids.push(tid);
+            }
+        }
+        drop(tag_name_map);
+
+        // Participants
+        let part_rows: Vec<(String, String, String, NaiveDateTime)> = sqlx::query_as(
+            "SELECT cp.campaign_id, cp.user_id, u.name, cp.created_at \
+             FROM campaign_participants cp JOIN users u ON cp.user_id = u.id \
+             ORDER BY cp.created_at ASC",
+        )
+        .fetch_all(pool).await?;
+        for (cid, uid, uname, joined_at) in part_rows {
+            if let Some(camp) = campaigns.get_mut(&cid) {
+                camp.participants.push(ParticipantRes {
+                    user_id: uid.clone(), name: uname, joined_at,
+                });
+                camp.participant_user_ids.insert(uid);
+                camp.last_joined_at = Some(joined_at);
+            }
+        }
+
+        // Finalize campaign status + compute open_credit_used
+        for (_, camp) in campaigns.iter_mut() {
+            if camp.current_count() >= camp.goal_count {
+                camp.status = "closed".to_string();
+            }
+        }
+        for (cid, camp) in &campaigns {
+            if camp.status == "open" {
+                for p in &camp.participants {
+                    if let Some(user) = users.get_mut(&p.user_id) {
+                        user.open_credit_used += camp.price;
+                    }
+                }
+            }
+        }
+
+        *self.users.write().await = users;
+        *self.campaigns.write().await = campaigns;
+
+        // Charges
+        let charge_rows: Vec<(String, NaiveDateTime, String, String, String, i32)> =
+            sqlx::query_as(
+                "SELECT ch.id, ch.created_at, cp.user_id, c.id, c.name, c.price \
+                 FROM charges ch \
+                 JOIN campaign_participants cp ON ch.campaign_participant_id = cp.id \
+                 JOIN campaigns c ON cp.campaign_id = c.id \
+                 ORDER BY ch.created_at DESC",
+            )
+            .fetch_all(pool).await?;
+        let mut charges: HashMap<String, Vec<ChargeEntry>> = HashMap::new();
+        for (id, created_at, uid, cid, cname, cprice) in charge_rows {
+            charges.entry(uid).or_default().push(ChargeEntry {
+                id, amount: cprice, campaign_id: cid, campaign_name: cname,
+                campaign_price: cprice, created_at,
+            });
+        }
+        *self.charges.write().await = charges;
+
+        // Saved searches
+        let ss_rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, user_id FROM saved_searches")
+                .fetch_all(pool).await?;
+        let sst_rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT saved_search_id, tag_id FROM saved_search_tags")
+                .fetch_all(pool).await?;
+        let mut ss_tags: HashMap<String, HashSet<String>> = HashMap::new();
+        for (ssid, tid) in sst_rows {
+            ss_tags.entry(ssid).or_default().insert(tid);
+        }
+        let mut saved_searches: HashMap<String, Vec<MemSavedSearch>> = HashMap::new();
+        for (ssid, uid) in ss_rows {
+            let tag_ids = ss_tags.remove(&ssid).unwrap_or_default();
+            saved_searches.entry(uid).or_default().push(MemSavedSearch { tag_ids });
+        }
+        *self.saved_searches.write().await = saved_searches;
+
+        // Webhook URL
+        let url_row: Option<(String,)> = sqlx::query_as(
+            "SELECT value FROM app_config WHERE name = 'notification_webhook_url'",
+        )
+        .fetch_optional(pool).await?;
+        *self.webhook_url.write().await = url_row.map(|(v,)| v).unwrap_or_default();
+
+        // Clear image cache (will warm lazily)
+        self.campaign_image.write().await.clear();
+
+        Ok(())
+    }
 }
+
+// ── main ──
 
 #[tokio::main]
 async fn main() {
     let dsn = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://isucon:isucon@127.0.0.1:3306/nrb2026".to_string());
-
     let db = parse_db_url(&dsn);
-
     let pool = MySqlPoolOptions::new()
         .max_connections(16)
         .connect(&dsn)
@@ -119,17 +316,20 @@ async fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| image_dir.join("seed"));
 
-    let http = reqwest::Client::new();
     let (webhook_tx, webhook_rx) = mpsc::channel(8192);
-    tokio::spawn(webhook_worker(http.clone(), webhook_rx));
+    let http = reqwest::Client::new();
+    tokio::spawn(webhook_worker(http, webhook_rx));
+
+    let store = Arc::new(Store::new());
+    // Auto-load from DB on startup (for restart recovery / 追試)
+    if let Err(e) = store.load_from_db(&pool).await {
+        eprintln!("startup load_from_db failed (expected on first boot): {e:?}");
+    }
 
     let state = AppState {
-        pool,
-        sql_dir,
-        image_dir,
-        seed_image_dir,
+        pool, sql_dir, image_dir, seed_image_dir,
         db: Arc::new(db),
-        cache: Arc::new(AppCache::default()),
+        store,
         webhook_tx,
     };
 
@@ -146,33 +346,23 @@ async fn main() {
         .route("/campaigns/:id/join", post(join_campaign))
         .route("/saved_searches", post(create_saved_search))
         .route("/charges", get(list_charges))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
-    let api = unauthed_api
-        .merge(authed_api)
+    let api = unauthed_api.merge(authed_api)
         .fallback(|| async { StatusCode::NOT_FOUND });
 
     let static_dir: Option<PathBuf> = std::env::var_os("STATIC_DIR").map(PathBuf::from);
-
     let mut app = Router::<AppState>::new()
         .route("/healthz", get(healthz))
         .nest("/api", api);
-
     if let Some(dir) = static_dir {
         let index = dir.join("index.html");
         if !index.is_file() {
-            panic!(
-                "STATIC_DIR index.html not found: {} (set STATIC_DIR to the Vite build dir, or unset to skip SPA fallback)",
-                index.display()
-            );
+            panic!("STATIC_DIR index.html not found: {}", index.display());
         }
         let serve = ServeDir::new(&dir).not_found_service(ServeFile::new(index));
         app = app.fallback_service(serve);
     }
-
     let app = app.with_state(state);
 
     let port: u16 = std::env::var("PORT")
@@ -180,8 +370,7 @@ async fn main() {
         .parse()
         .expect("PORT must be a valid u16");
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
+    let listener = tokio::net::TcpListener::bind(addr).await
         .unwrap_or_else(|e| panic!("bind {addr}: {e}"));
     axum::serve(listener, app).await.unwrap();
 }
@@ -198,21 +387,18 @@ fn parse_db_url(dsn: &str) -> DbConn {
 }
 
 async fn webhook_worker(http: reqwest::Client, mut rx: mpsc::Receiver<WebhookMessage>) {
-    while let Some(message) = rx.recv().await {
-        if let Err(e) = http.post(&message.url).json(&message.body).send().await {
-            eprintln!("webhook send to {}: {e}", message.url);
+    while let Some(msg) = rx.recv().await {
+        if let Err(e) = http.post(&msg.url).json(&msg.body).send().await {
+            eprintln!("webhook send to {}: {e}", msg.url);
         }
     }
 }
 
+// ── Error / helpers ──
+
 #[derive(Debug)]
 enum AppError {
-    Unauthorized,
-    BadRequest,
-    PaymentRequired,
-    NotFound,
-    Conflict,
-    PayloadTooLarge,
+    Unauthorized, BadRequest, PaymentRequired, NotFound, Conflict, PayloadTooLarge,
     Internal(String),
 }
 
@@ -225,49 +411,26 @@ impl IntoResponse for AppError {
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::Conflict => StatusCode::CONFLICT,
             AppError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-            AppError::Internal(ref msg) => {
-                eprintln!("internal error: {msg}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            AppError::Internal(ref msg) => { eprintln!("internal error: {msg}"); StatusCode::INTERNAL_SERVER_ERROR }
         };
         (status, "").into_response()
     }
 }
 
 impl From<sqlx::Error> for AppError {
-    fn from(e: sqlx::Error) -> Self {
-        AppError::Internal(format!("sqlx: {e}"))
-    }
-}
-
-fn response_from_json_bytes(body: Arc<Vec<u8>>) -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        Body::from(body.as_ref().clone()),
-    )
-        .into_response()
-}
-
-fn serialize_json<T: Serialize>(value: &T) -> Result<Arc<Vec<u8>>, AppError> {
-    let bytes = serde_json::to_vec(value).map_err(|e| AppError::Internal(format!("json: {e}")))?;
-    Ok(Arc::new(bytes))
+    fn from(e: sqlx::Error) -> Self { AppError::Internal(format!("sqlx: {e}")) }
 }
 
 struct JsonReq<T>(T);
 
 #[axum::async_trait]
 impl<T, S> FromRequest<S> for JsonReq<T>
-where
-    T: serde::de::DeserializeOwned,
-    S: Send + Sync,
+where T: serde::de::DeserializeOwned, S: Send + Sync,
 {
     type Rejection = AppError;
-
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
         let bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
-            .await
-            .map_err(|_| AppError::BadRequest)?;
+            .await.map_err(|_| AppError::BadRequest)?;
         let v: T = serde_json::from_slice(&bytes).map_err(|_| AppError::BadRequest)?;
         Ok(JsonReq(v))
     }
@@ -278,76 +441,53 @@ async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    let header = req
-        .headers()
-        .get("x-user-id")
+    let header = req.headers().get("x-user-id")
         .and_then(|v| v.to_str().ok())
         .ok_or(AppError::Unauthorized)?;
     let user_id = Uuid::parse_str(header).map_err(|_| AppError::Unauthorized)?;
-    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM users WHERE id = ?")
-        .bind(user_id.to_string())
-        .fetch_optional(&state.pool)
-        .await?;
-    if exists.is_none() {
+    let user_id_s = user_id.to_string();
+    if !state.store.users.read().await.contains_key(&user_id_s) {
         return Err(AppError::Unauthorized);
     }
     req.extensions_mut().insert(AuthUser(user_id));
     Ok(next.run(req).await)
 }
 
-fn now_naive() -> NaiveDateTime {
-    Utc::now().naive_utc()
-}
+fn now_naive() -> NaiveDateTime { Utc::now().naive_utc() }
 
-fn fmt_dt(dt: NaiveDateTime) -> String {
-    dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
-}
+fn fmt_dt(dt: NaiveDateTime) -> String { dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string() }
 
 fn serialize_dt<S: Serializer>(dt: &NaiveDateTime, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&fmt_dt(*dt))
 }
 
+fn serialize_dt_opt<S: Serializer>(dt: &Option<NaiveDateTime>, s: S) -> Result<S::Ok, S::Error> {
+    match dt { Some(dt) => s.serialize_str(&fmt_dt(*dt)), None => s.serialize_none() }
+}
+
 fn validate_price(price: i32) -> Result<(), AppError> {
-    if !(2000..=20000).contains(&price) {
-        return Err(AppError::BadRequest);
-    }
+    if !(2000..=20000).contains(&price) { return Err(AppError::BadRequest); }
     Ok(())
 }
 
 fn validate_jpeg_image_b64(b64: &str) -> Result<Vec<u8>, AppError> {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
-
     let bytes = STANDARD.decode(b64).map_err(|_| AppError::BadRequest)?;
-    if bytes.is_empty() {
-        return Err(AppError::BadRequest);
-    }
-    if bytes.len() > 204_800 {
-        return Err(AppError::PayloadTooLarge);
-    }
+    if bytes.is_empty() { return Err(AppError::BadRequest); }
+    if bytes.len() > 204_800 { return Err(AppError::PayloadTooLarge); }
     if bytes.len() < 3 || bytes[0] != 0xFF || bytes[1] != 0xD8 || bytes[2] != 0xFF {
         return Err(AppError::BadRequest);
     }
     Ok(bytes)
 }
 
-fn serialize_dt_opt<S: Serializer>(dt: &Option<NaiveDateTime>, s: S) -> Result<S::Ok, S::Error> {
-    match dt {
-        Some(dt) => s.serialize_str(&fmt_dt(*dt)),
-        None => s.serialize_none(),
-    }
-}
+// ── Response types ──
 
 #[derive(Clone, Serialize)]
 struct CampaignRes {
-    id: String,
-    name: String,
-    description: String,
-    price: i32,
-    goal_count: i32,
-    current_count: i32,
-    tags: Vec<String>,
-    status: String,
+    id: String, name: String, description: String, price: i32,
+    goal_count: i32, current_count: i32, tags: Vec<String>, status: String,
     #[serde(serialize_with = "serialize_dt")]
     created_at: NaiveDateTime,
     #[serde(serialize_with = "serialize_dt_opt")]
@@ -357,16 +497,31 @@ struct CampaignRes {
 
 #[derive(Clone, Serialize)]
 struct ParticipantRes {
-    user_id: String,
-    name: String,
+    user_id: String, name: String,
     #[serde(serialize_with = "serialize_dt")]
     joined_at: NaiveDateTime,
 }
 
-#[derive(Deserialize)]
-struct InitReq {
-    notification_webhook_url: String,
+#[derive(Serialize)]
+struct UserRes { id: String, name: String, credit_limit: i32 }
+
+#[derive(Serialize)]
+struct MeRes { id: String, name: String, credit_limit: i32, credit_used: i32 }
+
+#[derive(Clone, Serialize)]
+struct ChargeRes {
+    id: String, amount: i32, campaign: ChargeCampaign,
+    #[serde(serialize_with = "serialize_dt")]
+    created_at: NaiveDateTime,
 }
+
+#[derive(Clone, Serialize)]
+struct ChargeCampaign { id: String, name: String, price: i32 }
+
+// ── Initialize ──
+
+#[derive(Deserialize)]
+struct InitReq { notification_webhook_url: String }
 
 async fn initialize(
     State(state): State<AppState>,
@@ -387,11 +542,10 @@ async fn initialize(
     )
     .bind("notification_webhook_url")
     .bind(&req.notification_webhook_url)
-    .execute(&state.pool)
-    .await?;
+    .execute(&state.pool).await?;
 
-    state.cache.clear_all().await;
     reset_image_dir(&state).await?;
+    state.store.load_from_db(&state.pool).await?;
 
     Ok(Json(serde_json::json!({})))
 }
@@ -400,85 +554,11 @@ async fn reset_image_dir(state: &AppState) -> Result<(), AppError> {
     match tokio::fs::remove_dir_all(&state.image_dir).await {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(AppError::Internal(format!(
-                "remove image dir {}: {e}",
-                state.image_dir.display()
-            )));
-        }
+        Err(e) => return Err(AppError::Internal(format!("remove image dir: {e}"))),
     }
-    tokio::fs::create_dir_all(&state.image_dir)
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "create image dir {}: {e}",
-                state.image_dir.display()
-            ))
-        })?;
+    tokio::fs::create_dir_all(&state.image_dir).await
+        .map_err(|e| AppError::Internal(format!("create image dir: {e}")))?;
     Ok(())
-}
-
-async fn write_campaign_image_file(
-    state: &AppState,
-    campaign_id: &str,
-    bytes: &[u8],
-) -> Result<ImageCache, AppError> {
-    tokio::fs::create_dir_all(&state.image_dir)
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "create image dir {}: {e}",
-                state.image_dir.display()
-            ))
-        })?;
-    let path = state.image_dir.join(format!("{campaign_id}.jpg"));
-    tokio::fs::write(&path, bytes)
-        .await
-        .map_err(|e| AppError::Internal(format!("write image {}: {e}", path.display())))?;
-    let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(bytes)));
-    Ok(ImageCache { path, etag })
-}
-
-async fn image_cache_from_file(path: PathBuf) -> Result<Option<ImageCache>, AppError> {
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(AppError::Internal(format!(
-                "read image {}: {e}",
-                path.display()
-            )))
-        }
-    };
-    let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(&bytes)));
-    Ok(Some(ImageCache { path, etag }))
-}
-
-async fn load_campaign_image(state: &AppState, campaign_id: &str) -> Result<ImageCache, AppError> {
-    let seed_path = state.seed_image_dir.join(format!("{campaign_id}.jpg"));
-    if let Some(image) = image_cache_from_file(seed_path).await? {
-        return Ok(image);
-    }
-    let dynamic_path = state.image_dir.join(format!("{campaign_id}.jpg"));
-    if let Some(image) = image_cache_from_file(dynamic_path).await? {
-        return Ok(image);
-    }
-    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT image FROM campaigns WHERE id = ?")
-        .bind(campaign_id)
-        .fetch_optional(&state.pool)
-        .await?;
-    let bytes = match row {
-        Some((bytes,)) => bytes,
-        None => return Err(AppError::NotFound),
-    };
-    write_campaign_image_file(state, campaign_id, &bytes).await
-}
-
-async fn healthz(State(state): State<AppState>) -> StatusCode {
-    match sqlx::query("SELECT 1").fetch_one(&state.pool).await {
-        Ok(_) => StatusCode::OK,
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
-    }
 }
 
 async fn run_mysql_file(state: &AppState, path: &std::path::Path) -> Result<(), AppError> {
@@ -486,163 +566,93 @@ async fn run_mysql_file(state: &AppState, path: &std::path::Path) -> Result<(), 
         .map_err(|e| AppError::Internal(format!("open {}: {e}", path.display())))?;
     let status = Command::new("mysql")
         .env("MYSQL_PWD", &state.db.password)
-        .arg("-h")
-        .arg(&state.db.host)
-        .arg("-P")
-        .arg(state.db.port.to_string())
-        .arg("-u")
-        .arg(&state.db.user)
+        .arg("-h").arg(&state.db.host)
+        .arg("-P").arg(state.db.port.to_string())
+        .arg("-u").arg(&state.db.user)
         .arg("--protocol=TCP")
         .arg("--default-character-set=utf8mb4")
         .arg(&state.db.database)
         .stdin(Stdio::from(f))
-        .status()
-        .await
+        .status().await
         .map_err(|e| AppError::Internal(format!("spawn mysql: {e}")))?;
-    if !status.success() {
-        return Err(AppError::Internal(format!("mysql exit {status}")));
-    }
+    if !status.success() { return Err(AppError::Internal(format!("mysql exit {status}"))); }
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct CreateUserReq {
-    name: String,
-}
+async fn healthz() -> StatusCode { StatusCode::OK }
 
-#[derive(Serialize)]
-struct UserRes {
-    id: String,
-    name: String,
-    credit_limit: i32,
-}
+// ── User APIs ──
+
+#[derive(Deserialize)]
+struct CreateUserReq { name: String }
 
 async fn create_user(
     State(state): State<AppState>,
     JsonReq(req): JsonReq<CreateUserReq>,
 ) -> Result<Json<UserRes>, AppError> {
     let len = req.name.chars().count();
-    if len == 0 || len > 100 {
-        return Err(AppError::BadRequest);
-    }
+    if len == 0 || len > 100 { return Err(AppError::BadRequest); }
     let id = Uuid::new_v4().to_string();
     let now = now_naive();
     let credit_limit = DEFAULT_CREDIT_LIMIT;
-    sqlx::query("INSERT INTO users (id, name, credit_limit, created_at) VALUES (?, ?, ?, ?)")
-        .bind(&id)
-        .bind(&req.name)
-        .bind(credit_limit)
-        .bind(now)
-        .execute(&state.pool)
-        .await?;
-    Ok(Json(UserRes {
-        id,
-        name: req.name,
-        credit_limit,
-    }))
-}
 
-#[derive(Serialize)]
-struct MeRes {
-    id: String,
-    name: String,
-    credit_limit: i32,
-    credit_used: i32,
+    sqlx::query("INSERT INTO users (id, name, credit_limit, created_at) VALUES (?, ?, ?, ?)")
+        .bind(&id).bind(&req.name).bind(credit_limit).bind(now)
+        .execute(&state.pool).await?;
+
+    let _guard = state.store.write_lock.lock().await;
+    state.store.users.write().await.insert(id.clone(), MemUser {
+        name: req.name.clone(), credit_limit, open_credit_used: 0,
+    });
+    drop(_guard);
+
+    Ok(Json(UserRes { id, name: req.name, credit_limit }))
 }
 
 async fn get_me(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
-) -> Result<Response, AppError> {
+) -> Result<Json<MeRes>, AppError> {
     let user_id_s = user_id.to_string();
-    if let Some(body) = state.cache.me_json.read().await.get(&user_id_s).cloned() {
-        return Ok(response_from_json_bytes(body));
-    }
-
-    let row: Option<(String, i32)> =
-        sqlx::query_as("SELECT name, credit_limit FROM users WHERE id = ?")
-            .bind(&user_id_s)
-            .fetch_optional(&state.pool)
-            .await?;
-    let (name, credit_limit) = row.ok_or(AppError::Unauthorized)?;
-
-    let credit_used = fetch_open_credit_used(&state.pool, &user_id_s).await?;
-
-    let res = MeRes {
-        id: user_id_s.clone(),
-        name,
-        credit_limit,
-        credit_used: credit_used as i32,
-    };
-    let body = serialize_json(&res)?;
-    state.cache.me_json.write().await.insert(user_id_s, body.clone());
-    Ok(response_from_json_bytes(body))
+    let users = state.store.users.read().await;
+    let user = users.get(&user_id_s).ok_or(AppError::Unauthorized)?;
+    Ok(Json(MeRes {
+        id: user_id_s,
+        name: user.name.clone(),
+        credit_limit: user.credit_limit,
+        credit_used: user.open_credit_used,
+    }))
 }
 
-async fn fetch_open_credit_used(pool: &MySqlPool, user_id: &str) -> Result<i64, AppError> {
-    let (credit_used,): (i64,) = sqlx::query_as(
-        "SELECT CAST(COALESCE(SUM(c.price), 0) AS SIGNED) \
-         FROM campaign_participants cp \
-         JOIN campaigns c ON c.id = cp.campaign_id \
-         JOIN ( \
-             SELECT campaign_id, COUNT(*) AS current_count \
-             FROM campaign_participants \
-             GROUP BY campaign_id \
-         ) cc ON cc.campaign_id = c.id \
-         WHERE cp.user_id = ? AND cc.current_count < c.goal_count",
-    )
-    .bind(user_id)
-    .fetch_one(pool)
-    .await?;
-    Ok(credit_used)
+// ── Tags ──
+
+async fn list_tags(State(state): State<AppState>) -> Result<Json<Vec<String>>, AppError> {
+    let tags = state.store.tags.read().await;
+    Ok(Json(tags.clone()))
 }
 
-async fn list_tags(State(state): State<AppState>) -> Result<Response, AppError> {
-    if let Some(body) = state.cache.tags_json.read().await.clone() {
-        return Ok(response_from_json_bytes(body));
-    }
-
-    let rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM tags")
-        .fetch_all(&state.pool)
-        .await?;
-    let tags: Vec<String> = rows.into_iter().map(|(n,)| n).collect();
-    let body = serialize_json(&tags)?;
-    *state.cache.tags_json.write().await = Some(body.clone());
-    Ok(response_from_json_bytes(body))
-}
+// ── Campaigns ──
 
 #[derive(Deserialize)]
-struct ListCampaignsQuery {
-    tags: Option<String>,
-    sort: Option<String>,
-}
+struct ListCampaignsQuery { tags: Option<String>, sort: Option<String> }
 
 async fn list_campaigns(
     State(state): State<AppState>,
     AxumQuery(q): AxumQuery<ListCampaignsQuery>,
-) -> Result<Response, AppError> {
-    let mut tag_ids: Vec<String> = match q.tags.as_deref() {
+) -> Result<Json<Vec<CampaignRes>>, AppError> {
+    let filter_tag_names: Vec<String> = match q.tags.as_deref() {
         Some(s) if !s.is_empty() => {
             let parts: Vec<String> = s.split(',').map(|p| p.to_string()).collect();
-            if parts.len() > 3 {
-                return Err(AppError::BadRequest);
-            }
+            if parts.len() > 3 { return Err(AppError::BadRequest); }
             let mut seen = HashSet::new();
             for p in &parts {
-                if !seen.insert(p.clone()) {
-                    return Err(AppError::BadRequest);
-                }
+                if !seen.insert(p.clone()) { return Err(AppError::BadRequest); }
             }
-            let mut tag_ids = Vec::with_capacity(parts.len());
+            let tag_map = state.store.tag_id_by_name.read().await;
             for p in &parts {
-                let r: Option<(String,)> = sqlx::query_as("SELECT id FROM tags WHERE name = ?")
-                    .bind(p)
-                    .fetch_optional(&state.pool)
-                    .await?;
-                let (tag_id,) = r.ok_or(AppError::BadRequest)?;
-                tag_ids.push(tag_id);
+                if !tag_map.contains_key(p) { return Err(AppError::BadRequest); }
             }
-            tag_ids
+            parts
         }
         _ => Vec::new(),
     };
@@ -652,262 +662,108 @@ async fn list_campaigns(
         Some("new") | None => "new",
         _ => return Err(AppError::BadRequest),
     };
-    tag_ids.sort();
-    let list_cache_key = format!("sort={sort_mode};tags={}", tag_ids.join(","));
-    if let Some(body) = state.cache.list_campaigns_json.read().await.get(&list_cache_key).cloned() {
-        return Ok(response_from_json_bytes(body));
-    }
 
-    let mut qb = QueryBuilder::<MySql>::new(
-        "SELECT c.id, c.name, c.description, c.price, c.goal_count, c.created_at, \
-         COUNT(cp.id) AS current_count, MAX(cp.created_at) AS last_joined_at \
-         FROM campaigns c \
-         LEFT JOIN campaign_participants cp ON cp.campaign_id = c.id",
-    );
-    if !tag_ids.is_empty() {
-        qb.push(" WHERE c.id IN (SELECT ct.campaign_id FROM campaign_tags ct WHERE ct.tag_id IN (");
-        let mut separated = qb.separated(", ");
-        for tag_id in &tag_ids {
-            separated.push_bind(tag_id);
-        }
-        drop(separated);
-        qb.push(") GROUP BY ct.campaign_id HAVING COUNT(DISTINCT ct.tag_id) = ");
-        qb.push_bind(tag_ids.len() as i64);
-        qb.push(")");
-    }
-    qb.push(
-        " GROUP BY c.id, c.name, c.description, c.price, c.goal_count, c.created_at \
-         HAVING COUNT(cp.id) < c.goal_count ORDER BY ",
-    );
+    let campaigns = state.store.campaigns.read().await;
+    let mut open: Vec<CampaignRes> = campaigns.iter()
+        .filter(|(_, c)| c.status == "open")
+        .filter(|(_, c)| {
+            filter_tag_names.iter().all(|tag| c.tags.contains(tag))
+        })
+        .map(|(id, c)| c.to_response(id))
+        .collect();
+
     if sort_mode == "active" {
-        qb.push("COALESCE(MAX(cp.created_at), c.created_at) DESC");
-    } else {
-        qb.push("c.created_at DESC");
-    }
-    qb.push(" LIMIT 30");
-
-    let rows: Vec<(
-        String,
-        String,
-        String,
-        i32,
-        i32,
-        NaiveDateTime,
-        i64,
-        Option<NaiveDateTime>,
-    )> = qb.build_query_as().fetch_all(&state.pool).await?;
-    let campaign_ids: Vec<String> = rows.iter().map(|row| row.0.clone()).collect();
-    let tags_by_campaign = fetch_tags_by_campaign(&state.pool, &campaign_ids).await?;
-    let participants_by_campaign =
-        fetch_participants_by_campaign(&state.pool, &campaign_ids).await?;
-
-    let all: Vec<CampaignRes> = rows
-        .into_iter()
-        .map(
-            |(
-                id,
-                name,
-                description,
-                price,
-                goal_count,
-                created_at,
-                _current_count,
-                last_joined_at,
-            )| {
-                let tags = tags_by_campaign.get(&id).cloned().unwrap_or_default();
-                let participants = participants_by_campaign
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_default();
-                let current_count = participants.len() as i32;
-                CampaignRes {
-                    id,
-                    name,
-                    description,
-                    price,
-                    goal_count,
-                    current_count,
-                    tags,
-                    status: if current_count >= goal_count { "closed" } else { "open" }.to_string(),
-                    created_at,
-                    last_joined_at,
-                    participants,
-                }
-            },
-        )
-        .collect();
-
-    let body = serialize_json(&all)?;
-    state.cache.list_campaigns_json.write().await.insert(list_cache_key, body.clone());
-    Ok(response_from_json_bytes(body))
-}
-
-async fn fetch_tags_by_campaign(
-    pool: &MySqlPool,
-    campaign_ids: &[String],
-) -> Result<HashMap<String, Vec<String>>, AppError> {
-    let mut tags_by_campaign: HashMap<String, Vec<String>> = HashMap::new();
-    if campaign_ids.is_empty() {
-        return Ok(tags_by_campaign);
-    }
-
-    let mut qb = QueryBuilder::<MySql>::new(
-        "SELECT ct.campaign_id, t.name \
-         FROM campaign_tags ct \
-         JOIN tags t ON ct.tag_id = t.id \
-         WHERE ct.campaign_id IN (",
-    );
-    let mut separated = qb.separated(", ");
-    for campaign_id in campaign_ids {
-        separated.push_bind(campaign_id);
-    }
-    drop(separated);
-    qb.push(")");
-
-    let rows: Vec<(String, String)> = qb.build_query_as().fetch_all(pool).await?;
-    for (campaign_id, tag_name) in rows {
-        tags_by_campaign
-            .entry(campaign_id)
-            .or_default()
-            .push(tag_name);
-    }
-    Ok(tags_by_campaign)
-}
-
-async fn fetch_participants_by_campaign(
-    pool: &MySqlPool,
-    campaign_ids: &[String],
-) -> Result<HashMap<String, Vec<ParticipantRes>>, AppError> {
-    let mut participants_by_campaign: HashMap<String, Vec<ParticipantRes>> = HashMap::new();
-    if campaign_ids.is_empty() {
-        return Ok(participants_by_campaign);
-    }
-
-    let mut qb = QueryBuilder::<MySql>::new(
-        "SELECT cp.campaign_id, cp.user_id, u.name, cp.created_at \
-         FROM campaign_participants cp \
-         JOIN users u ON cp.user_id = u.id \
-         WHERE cp.campaign_id IN (",
-    );
-    let mut separated = qb.separated(", ");
-    for campaign_id in campaign_ids {
-        separated.push_bind(campaign_id);
-    }
-    drop(separated);
-    qb.push(") ORDER BY cp.campaign_id, cp.created_at ASC");
-
-    let rows: Vec<(String, String, String, NaiveDateTime)> =
-        qb.build_query_as().fetch_all(pool).await?;
-    for (campaign_id, user_id, name, joined_at) in rows {
-        participants_by_campaign
-            .entry(campaign_id)
-            .or_default()
-            .push(ParticipantRes {
-                user_id,
-                name,
-                joined_at,
-            });
-    }
-    Ok(participants_by_campaign)
-}
-
-async fn warm_read_cache(state: &AppState) -> Result<(), AppError> {
-    let tag_rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM tags")
-        .fetch_all(&state.pool)
-        .await?;
-    let tags: Vec<String> = tag_rows.into_iter().map(|(name,)| name).collect();
-    *state.cache.tags_json.write().await = Some(serialize_json(&tags)?);
-
-    let rows: Vec<(
-        String,
-        String,
-        String,
-        i32,
-        i32,
-        NaiveDateTime,
-        i64,
-        Option<NaiveDateTime>,
-    )> = sqlx::query_as(
-        "SELECT c.id, c.name, c.description, c.price, c.goal_count, c.created_at, \
-         COUNT(cp.id) AS current_count, MAX(cp.created_at) AS last_joined_at \
-         FROM campaigns c \
-         LEFT JOIN campaign_participants cp ON cp.campaign_id = c.id \
-         GROUP BY c.id, c.name, c.description, c.price, c.goal_count, c.created_at",
-    )
-    .fetch_all(&state.pool)
-    .await?;
-    let campaign_ids: Vec<String> = rows.iter().map(|row| row.0.clone()).collect();
-    let tags_by_campaign = fetch_tags_by_campaign(&state.pool, &campaign_ids).await?;
-    let participants_by_campaign =
-        fetch_participants_by_campaign(&state.pool, &campaign_ids).await?;
-
-    let mut campaigns = Vec::with_capacity(rows.len());
-    for (id, name, description, price, goal_count, created_at, _current_count, last_joined_at) in
-        rows
-    {
-        let participants = participants_by_campaign
-            .get(&id)
-            .cloned()
-            .unwrap_or_default();
-        let current_count = participants.len() as i32;
-        let status = if current_count >= goal_count {
-            "closed"
-        } else {
-            "open"
-        };
-        campaigns.push(CampaignRes {
-            tags: tags_by_campaign.get(&id).cloned().unwrap_or_default(),
-            participants,
-            id,
-            name,
-            description,
-            price,
-            goal_count,
-            current_count,
-            status: status.to_string(),
-            created_at,
-            last_joined_at,
+        open.sort_by(|a, b| {
+            let ak = a.last_joined_at.unwrap_or(a.created_at);
+            let bk = b.last_joined_at.unwrap_or(b.created_at);
+            bk.cmp(&ak)
         });
+    } else {
+        open.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     }
+    open.truncate(30);
 
-    let mut campaign_json = HashMap::with_capacity(campaigns.len());
-    for campaign in &campaigns {
-        campaign_json.insert(campaign.id.clone(), serialize_json(campaign)?);
-    }
-    *state.cache.campaign_json.write().await = campaign_json;
-
-    let mut open_campaigns: Vec<CampaignRes> = campaigns
-        .into_iter()
-        .filter(|campaign| campaign.status == "open")
-        .collect();
-    open_campaigns.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    let latest: Vec<CampaignRes> = open_campaigns.iter().take(30).cloned().collect();
-
-    open_campaigns.sort_by(|a, b| {
-        let ak = a.last_joined_at.unwrap_or(a.created_at);
-        let bk = b.last_joined_at.unwrap_or(b.created_at);
-        bk.cmp(&ak)
-    });
-    let active: Vec<CampaignRes> = open_campaigns.iter().take(30).cloned().collect();
-
-    let mut list_cache = HashMap::new();
-    list_cache.insert("sort=new;tags=".to_string(), serialize_json(&latest)?);
-    list_cache.insert("sort=active;tags=".to_string(), serialize_json(&active)?);
-    *state.cache.list_campaigns_json.write().await = list_cache;
-
-    // Image cache warms lazily via load_campaign_image (seed dir → dynamic dir → DB fallback).
-
-    Ok(())
+    Ok(Json(open))
 }
+
+async fn get_campaign(
+    State(state): State<AppState>,
+    Extension(_user): Extension<AuthUser>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<CampaignRes>, AppError> {
+    let campaigns = state.store.campaigns.read().await;
+    let camp = campaigns.get(&id).ok_or(AppError::NotFound)?;
+    Ok(Json(camp.to_response(&id)))
+}
+
+// ── Campaign image ──
+
+async fn get_campaign_image(
+    State(state): State<AppState>,
+    Extension(_user): Extension<AuthUser>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Response, AppError> {
+    if let Some(image) = state.store.campaign_image.read().await.get(&id).cloned() {
+        return image_response(image, &headers).await;
+    }
+    let image = load_campaign_image(&state, &id).await?;
+    state.store.campaign_image.write().await.insert(id, image.clone());
+    image_response(image, &headers).await
+}
+
+async fn load_campaign_image(state: &AppState, campaign_id: &str) -> Result<ImageCache, AppError> {
+    let seed_path = state.seed_image_dir.join(format!("{campaign_id}.jpg"));
+    if let Some(image) = image_cache_from_file(seed_path).await? { return Ok(image); }
+    let dynamic_path = state.image_dir.join(format!("{campaign_id}.jpg"));
+    if let Some(image) = image_cache_from_file(dynamic_path).await? { return Ok(image); }
+    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT image FROM campaigns WHERE id = ?")
+        .bind(campaign_id).fetch_optional(&state.pool).await?;
+    let bytes = match row { Some((b,)) => b, None => return Err(AppError::NotFound) };
+    write_campaign_image_file(state, campaign_id, &bytes).await
+}
+
+async fn image_cache_from_file(path: PathBuf) -> Result<Option<ImageCache>, AppError> {
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(AppError::Internal(format!("read image: {e}"))),
+    };
+    let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(&bytes)));
+    Ok(Some(ImageCache { path, etag }))
+}
+
+async fn write_campaign_image_file(state: &AppState, id: &str, bytes: &[u8]) -> Result<ImageCache, AppError> {
+    tokio::fs::create_dir_all(&state.image_dir).await
+        .map_err(|e| AppError::Internal(format!("create image dir: {e}")))?;
+    let path = state.image_dir.join(format!("{id}.jpg"));
+    tokio::fs::write(&path, bytes).await
+        .map_err(|e| AppError::Internal(format!("write image: {e}")))?;
+    let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(bytes)));
+    Ok(ImageCache { path, etag })
+}
+
+async fn image_response(image: ImageCache, headers: &HeaderMap) -> Result<Response, AppError> {
+    let not_modified = headers.get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == image.etag).unwrap_or(false);
+    if not_modified {
+        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, image.etag)]).into_response());
+    }
+    let bytes = tokio::fs::read(&image.path).await
+        .map_err(|e| AppError::Internal(format!("read image: {e}")))?;
+    Ok((StatusCode::OK, [
+        (header::CONTENT_TYPE, "image/jpeg".to_string()),
+        (header::ETAG, image.etag),
+    ], Body::from(bytes)).into_response())
+}
+
+// ── Create campaign ──
 
 #[derive(Deserialize)]
 struct CreateCampaignReq {
-    name: String,
-    description: String,
-    price: i32,
-    goal_count: i32,
-    tags: Vec<String>,
-    image: String,
+    name: String, description: String, price: i32, goal_count: i32,
+    tags: Vec<String>, image: String,
 }
 
 async fn create_campaign(
@@ -916,146 +772,66 @@ async fn create_campaign(
     JsonReq(req): JsonReq<CreateCampaignReq>,
 ) -> Result<(StatusCode, Json<CampaignRes>), AppError> {
     let name_len = req.name.chars().count();
-    if name_len == 0 || name_len > 100 {
-        return Err(AppError::BadRequest);
-    }
+    if name_len == 0 || name_len > 100 { return Err(AppError::BadRequest); }
     let desc_len = req.description.chars().count();
-    if desc_len == 0 || desc_len > 1000 {
-        return Err(AppError::BadRequest);
-    }
+    if desc_len == 0 || desc_len > 1000 { return Err(AppError::BadRequest); }
     validate_price(req.price)?;
-    if req.goal_count < 2 || req.goal_count > 20 {
-        return Err(AppError::BadRequest);
-    }
-    if req.tags.len() > 10 {
-        return Err(AppError::BadRequest);
-    }
+    if req.goal_count < 2 || req.goal_count > 20 { return Err(AppError::BadRequest); }
+    if req.tags.len() > 10 { return Err(AppError::BadRequest); }
     let mut seen_names = HashSet::new();
     for t in &req.tags {
-        if !seen_names.insert(t.clone()) {
-            return Err(AppError::BadRequest);
-        }
+        if !seen_names.insert(t.clone()) { return Err(AppError::BadRequest); }
     }
     let image_bytes = validate_jpeg_image_b64(&req.image)?;
-    let mut tag_ids: Vec<String> = Vec::new();
+
+    let tag_map = state.store.tag_id_by_name.read().await;
+    let mut tag_ids = Vec::new();
     for t in &req.tags {
-        let r: Option<(String,)> = sqlx::query_as("SELECT id FROM tags WHERE name = ?")
-            .bind(t)
-            .fetch_optional(&state.pool)
-            .await?;
-        match r {
-            Some((tid,)) => {
-                if tag_ids.iter().any(|id| id == &tid) {
-                    return Err(AppError::BadRequest);
-                }
-                tag_ids.push(tid);
-            }
-            None => return Err(AppError::BadRequest),
-        }
+        let tid = tag_map.get(t).ok_or(AppError::BadRequest)?;
+        if tag_ids.contains(tid) { return Err(AppError::BadRequest); }
+        tag_ids.push(tid.clone());
     }
+    drop(tag_map);
 
     let id = Uuid::new_v4().to_string();
     let now = now_naive();
+
+    // DB write (for persistence /追試)
     let mut tx = state.pool.begin().await?;
     sqlx::query(
         "INSERT INTO campaigns (id, name, description, price, goal_count, image, created_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(&id)
-    .bind(&req.name)
-    .bind(&req.description)
-    .bind(req.price)
-    .bind(req.goal_count)
-    .bind(&image_bytes)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
+    .bind(&id).bind(&req.name).bind(&req.description).bind(req.price)
+    .bind(req.goal_count).bind(&image_bytes).bind(now)
+    .execute(&mut *tx).await?;
     for tid in &tag_ids {
         sqlx::query("INSERT INTO campaign_tags (campaign_id, tag_id, created_at) VALUES (?, ?, ?)")
-            .bind(&id)
-            .bind(tid)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+            .bind(&id).bind(tid).bind(now)
+            .execute(&mut *tx).await?;
     }
     tx.commit().await?;
 
-    let res = hydrate_campaign_via_pool(&state.pool, &id)
-        .await?
-        .ok_or(AppError::Internal("created campaign vanished".into()))?;
-    state.cache.clear_list_campaigns().await;
-    state
-        .cache
-        .campaign_json
-        .write()
-        .await
-        .insert(id.clone(), serialize_json(&res)?);
+    let camp = MemCampaign {
+        name: req.name, description: req.description, price: req.price,
+        goal_count: req.goal_count, created_at: now,
+        tags: req.tags, tag_ids,
+        participants: Vec::new(), participant_user_ids: HashSet::new(),
+        status: "open".to_string(), last_joined_at: None,
+    };
+    let res = camp.to_response(&id);
+
+    let _guard = state.store.write_lock.lock().await;
+    state.store.campaigns.write().await.insert(id.clone(), camp);
+    drop(_guard);
+
     let image = write_campaign_image_file(&state, &id, &image_bytes).await?;
-    state.cache.campaign_image.write().await.insert(id, image);
+    state.store.campaign_image.write().await.insert(id, image);
+
     Ok((StatusCode::CREATED, Json(res)))
 }
 
-async fn get_campaign_image(
-    State(state): State<AppState>,
-    Extension(_user): Extension<AuthUser>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Response, AppError> {
-    if let Some(image) = state.cache.campaign_image.read().await.get(&id).cloned() {
-        return image_response(image, &headers).await;
-    }
-
-    let image = load_campaign_image(&state, &id).await?;
-    state
-        .cache
-        .campaign_image
-        .write()
-        .await
-        .insert(id, image.clone());
-    image_response(image, &headers).await
-}
-
-async fn image_response(image: ImageCache, headers: &HeaderMap) -> Result<Response, AppError> {
-    let not_modified = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value == image.etag)
-        .unwrap_or(false);
-    if not_modified {
-        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, image.etag)]).into_response());
-    }
-
-    let bytes = tokio::fs::read(&image.path)
-        .await
-        .map_err(|e| AppError::Internal(format!("read image {}: {e}", image.path.display())))?;
-
-    Ok((
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "image/jpeg".to_string()),
-            (header::ETAG, image.etag),
-        ],
-        Body::from(bytes),
-    )
-        .into_response())
-}
-
-async fn get_campaign(
-    State(state): State<AppState>,
-    Extension(_user): Extension<AuthUser>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Response, AppError> {
-    if let Some(body) = state.cache.campaign_json.read().await.get(&id).cloned() {
-        return Ok(response_from_json_bytes(body));
-    }
-
-    let campaign = hydrate_campaign_via_pool(&state.pool, &id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    let body = serialize_json(&campaign)?;
-    state.cache.campaign_json.write().await.insert(id, body.clone());
-    Ok(response_from_json_bytes(body))
-}
+// ── Join campaign ──
 
 #[derive(Deserialize)]
 struct JoinReq {}
@@ -1066,365 +842,196 @@ async fn join_campaign(
     AxumPath(campaign_id): AxumPath<String>,
     JsonReq(_): JsonReq<JoinReq>,
 ) -> Result<Json<CampaignRes>, AppError> {
-    let mut tx = state.pool.begin().await?;
+    let user_id_s = user_id.to_string();
+    let now = now_naive();
 
-    let (credit_limit,): (i32,) =
-        sqlx::query_as("SELECT credit_limit FROM users WHERE id = ? FOR UPDATE")
-            .bind(user_id.to_string())
-            .fetch_one(&mut *tx)
-            .await?;
+    let _guard = state.store.write_lock.lock().await;
+    let mut campaigns = state.store.campaigns.write().await;
+    let mut users = state.store.users.write().await;
 
-    let row = sqlx::query("SELECT goal_count, price FROM campaigns WHERE id = ? FOR UPDATE")
-        .bind(&campaign_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let (goal_count, price): (i32, i32) = match row {
-        Some(r) => (r.try_get("goal_count")?, r.try_get("price")?),
-        None => return Err(AppError::NotFound),
-    };
+    let camp = campaigns.get(&campaign_id).ok_or(AppError::NotFound)?;
+    let user = users.get(&user_id_s).ok_or(AppError::Unauthorized)?;
 
-    let (before,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM campaign_participants WHERE campaign_id = ?")
-            .bind(&campaign_id)
-            .fetch_one(&mut *tx)
-            .await?;
-    let before = before as i32;
-
-    if before >= goal_count {
-        return Err(AppError::Conflict);
-    }
-
-    let dup: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM campaign_participants WHERE campaign_id = ? AND user_id = ?",
-    )
-    .bind(&campaign_id)
-    .bind(user_id.to_string())
-    .fetch_optional(&mut *tx)
-    .await?;
-    if dup.is_some() {
-        return Err(AppError::Conflict);
-    }
-
-    let (before_credit_used,): (i64,) = sqlx::query_as(
-        "SELECT CAST(COALESCE(SUM(c.price), 0) AS SIGNED) \
-         FROM campaign_participants cp \
-         JOIN campaigns c ON c.id = cp.campaign_id \
-         JOIN ( \
-             SELECT campaign_id, COUNT(*) AS current_count \
-             FROM campaign_participants \
-             GROUP BY campaign_id \
-         ) cc ON cc.campaign_id = c.id \
-         WHERE cp.user_id = ? AND cc.current_count < c.goal_count",
-    )
-    .bind(user_id.to_string())
-    .fetch_one(&mut *tx)
-    .await?;
-    if before_credit_used as i32 + price > credit_limit {
+    if camp.current_count() >= camp.goal_count { return Err(AppError::Conflict); }
+    if camp.participant_user_ids.contains(&user_id_s) { return Err(AppError::Conflict); }
+    if user.open_credit_used + camp.price > user.credit_limit {
         return Err(AppError::PaymentRequired);
     }
 
-    let participant_id = Uuid::new_v4().to_string();
-    let now = now_naive();
-    sqlx::query(
-        "INSERT INTO campaign_participants (id, campaign_id, user_id, created_at) VALUES (?, ?, ?, ?)",
-    )
-    .bind(&participant_id)
-    .bind(&campaign_id)
-    .bind(user_id.to_string())
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-    let after = before + 1;
+    let price = camp.price;
+    let goal_count = camp.goal_count;
+    let camp_tag_ids: HashSet<String> = camp.tag_ids.iter().cloned().collect();
 
+    // Add participant
+    let camp = campaigns.get_mut(&campaign_id).unwrap();
+    camp.participants.push(ParticipantRes {
+        user_id: user_id_s.clone(), name: user.name.clone(), joined_at: now,
+    });
+    camp.participant_user_ids.insert(user_id_s.clone());
+    camp.last_joined_at = Some(now);
+
+    let user = users.get_mut(&user_id_s).unwrap();
+    user.open_credit_used += price;
+
+    let after = camp.current_count();
+
+    // Notification check (before potential close)
     let mut webhook_user_ids: Vec<String> = Vec::new();
-    let mut cache_clear_user_ids: HashSet<String> = HashSet::from([user_id.to_string()]);
     if after == goal_count - 1 {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT DISTINCT ss.user_id \
-             FROM saved_searches ss \
-             JOIN saved_search_tags sst ON sst.saved_search_id = ss.id \
-             LEFT JOIN campaign_tags ct ON ct.campaign_id = ? AND ct.tag_id = sst.tag_id \
-             GROUP BY ss.id, ss.user_id \
-             HAVING COUNT(*) = COUNT(ct.tag_id)",
-        )
-        .bind(&campaign_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        webhook_user_ids = rows.into_iter().map(|(u,)| u).collect();
-    }
-
-    if after == goal_count {
-        let part_rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT id, user_id FROM campaign_participants WHERE campaign_id = ?")
-                .bind(&campaign_id)
-                .fetch_all(&mut *tx)
-                .await?;
-        for (pid, uid) in part_rows {
-            cache_clear_user_ids.insert(uid);
-            sqlx::query(
-                "INSERT INTO charges (id, campaign_participant_id, created_at) VALUES (?, ?, ?)",
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(pid)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+        let ss = state.store.saved_searches.read().await;
+        let mut seen = HashSet::new();
+        for (uid, searches) in ss.iter() {
+            for search in searches {
+                if search.tag_ids.iter().all(|tid| camp_tag_ids.contains(tid)) {
+                    if seen.insert(uid.clone()) {
+                        webhook_user_ids.push(uid.clone());
+                    }
+                }
+            }
         }
     }
 
-    let response_campaign = hydrate_campaign(&mut *tx, &campaign_id)
-        .await?
-        .ok_or(AppError::Internal("modified campaign vanished".into()))?;
+    // Campaign close
+    if after == goal_count {
+        camp.status = "closed".to_string();
+        let participant_uids: Vec<String> = camp.participant_user_ids.iter().cloned().collect();
+        let camp_name = camp.name.clone();
+        let mut charges = state.store.charges.write().await;
+        for uid in &participant_uids {
+            if let Some(u) = users.get_mut(uid) {
+                u.open_credit_used -= price;
+            }
+            let charge = ChargeEntry {
+                id: Uuid::new_v4().to_string(),
+                amount: price,
+                campaign_id: campaign_id.clone(),
+                campaign_name: camp_name.clone(),
+                campaign_price: price,
+                created_at: now,
+            };
+            charges.entry(uid.clone()).or_default().insert(0, charge);
+        }
+    }
 
-    let webhook_url = if webhook_user_ids.is_empty() {
-        String::new()
-    } else {
-        let url_row: Option<(String,)> =
-            sqlx::query_as("SELECT value FROM app_config WHERE name = 'notification_webhook_url'")
-                .fetch_optional(&mut *tx)
-                .await?;
-        url_row.map(|(v,)| v).unwrap_or_default()
-    };
+    let response = camp.to_response(&campaign_id);
+    let webhook_url = state.store.webhook_url.read().await.clone();
 
+    drop(campaigns);
+    drop(users);
+    drop(_guard);
+
+    // Synchronous DB write (for persistence / 追試). Lock already released.
+    let participant_id = Uuid::new_v4().to_string();
+    let mut tx = state.pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO campaign_participants (id, campaign_id, user_id, created_at) VALUES (?, ?, ?, ?)",
+    ).bind(&participant_id).bind(&campaign_id).bind(&user_id_s).bind(now)
+        .execute(&mut *tx).await?;
+    if after == goal_count {
+        let parts: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM campaign_participants WHERE campaign_id = ?",
+        ).bind(&campaign_id).fetch_all(&mut *tx).await?;
+        for (pid,) in parts {
+            sqlx::query(
+                "INSERT INTO charges (id, campaign_participant_id, created_at) VALUES (?, ?, ?)",
+            ).bind(Uuid::new_v4().to_string()).bind(pid).bind(now)
+                .execute(&mut *tx).await?;
+        }
+    }
     tx.commit().await?;
 
-    // Single authority: safe to invalidate/update caches post-commit.
-    state.cache.clear_list_campaigns().await;
-    state.cache.clear_users(cache_clear_user_ids.iter().map(String::as_str)).await;
-    state.cache.campaign_json.write().await
-        .insert(campaign_id.clone(), serialize_json(&response_campaign)?);
-
+    // Webhooks
     if !webhook_user_ids.is_empty() && !webhook_url.is_empty() {
         for uid in &webhook_user_ids {
             let body = serde_json::json!({
                 "type": "campaign_closing_soon",
                 "user_id": uid,
                 "campaign": {
-                    "id": &response_campaign.id,
-                    "name": &response_campaign.name,
-                    "description": &response_campaign.description,
-                    "price": response_campaign.price,
-                    "goal_count": response_campaign.goal_count,
-                    "current_count": response_campaign.current_count,
-                    "tags": &response_campaign.tags,
-                    "status": &response_campaign.status,
-                    "created_at": fmt_dt(response_campaign.created_at),
-                    "last_joined_at": response_campaign.last_joined_at.map(fmt_dt),
+                    "id": &response.id,
+                    "name": &response.name,
+                    "description": &response.description,
+                    "price": response.price,
+                    "goal_count": response.goal_count,
+                    "current_count": response.current_count,
+                    "tags": &response.tags,
+                    "status": &response.status,
+                    "created_at": fmt_dt(response.created_at),
+                    "last_joined_at": response.last_joined_at.map(fmt_dt),
                 }
             });
-            let message = WebhookMessage {
-                url: webhook_url.clone(),
-                body,
-            };
-            if let Err(e) = state.webhook_tx.try_send(message) {
-                eprintln!("webhook queue full for user {uid}: {e}");
-            }
+            let _ = state.webhook_tx.try_send(WebhookMessage { url: webhook_url.clone(), body });
         }
     }
 
-    Ok(Json(response_campaign))
+    Ok(Json(response))
 }
 
+// ── Saved searches ──
+
 #[derive(Deserialize)]
-struct CreateSavedSearchReq {
-    tags: Vec<String>,
-}
+struct CreateSavedSearchReq { tags: Vec<String> }
 
 async fn create_saved_search(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
     JsonReq(req): JsonReq<CreateSavedSearchReq>,
 ) -> Result<StatusCode, AppError> {
-    if req.tags.is_empty() || req.tags.len() > 3 {
-        return Err(AppError::BadRequest);
-    }
+    if req.tags.is_empty() || req.tags.len() > 3 { return Err(AppError::BadRequest); }
     let mut seen_names = HashSet::new();
     for t in &req.tags {
-        if !seen_names.insert(t.clone()) {
-            return Err(AppError::BadRequest);
-        }
+        if !seen_names.insert(t.clone()) { return Err(AppError::BadRequest); }
     }
-    let mut tag_ids: Vec<String> = Vec::new();
+
+    let tag_map = state.store.tag_id_by_name.read().await;
+    let mut tag_ids = HashSet::new();
+    let mut tag_id_vec = Vec::new();
     for t in &req.tags {
-        let r: Option<(String,)> = sqlx::query_as("SELECT id FROM tags WHERE name = ?")
-            .bind(t)
-            .fetch_optional(&state.pool)
-            .await?;
-        match r {
-            Some((tid,)) => {
-                if tag_ids.iter().any(|id| id == &tid) {
-                    return Err(AppError::BadRequest);
-                }
-                tag_ids.push(tid);
-            }
-            None => return Err(AppError::BadRequest),
-        }
+        let tid = tag_map.get(t).ok_or(AppError::BadRequest)?;
+        if !tag_ids.insert(tid.clone()) { return Err(AppError::BadRequest); }
+        tag_id_vec.push(tid.clone());
     }
+    drop(tag_map);
 
-    let mut tx = state.pool.begin().await?;
-    sqlx::query("SELECT id FROM users WHERE id = ? FOR UPDATE")
-        .bind(user_id.to_string())
-        .fetch_one(&mut *tx)
-        .await?;
-    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM saved_searches WHERE user_id = ?")
-        .bind(user_id.to_string())
-        .fetch_one(&mut *tx)
-        .await?;
-    if count >= 10 {
-        return Err(AppError::Conflict);
-    }
+    let user_id_s = user_id.to_string();
+    let _guard = state.store.write_lock.lock().await;
+    let mut ss = state.store.saved_searches.write().await;
+    let user_searches = ss.entry(user_id_s.clone()).or_default();
+    if user_searches.len() >= 10 { return Err(AppError::Conflict); }
+    user_searches.push(MemSavedSearch { tag_ids });
+    drop(ss);
+    drop(_guard);
 
+    // Synchronous DB write (for persistence / 追試)
     let ss_id = Uuid::new_v4().to_string();
     let now = now_naive();
+    let mut tx = state.pool.begin().await?;
     sqlx::query("INSERT INTO saved_searches (id, user_id, created_at) VALUES (?, ?, ?)")
-        .bind(&ss_id)
-        .bind(user_id.to_string())
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-    for tid in &tag_ids {
+        .bind(&ss_id).bind(&user_id_s).bind(now)
+        .execute(&mut *tx).await?;
+    for tid in &tag_id_vec {
         sqlx::query(
             "INSERT INTO saved_search_tags (saved_search_id, tag_id, created_at) VALUES (?, ?, ?)",
-        )
-        .bind(&ss_id)
-        .bind(tid)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        ).bind(&ss_id).bind(tid).bind(now)
+            .execute(&mut *tx).await?;
     }
     tx.commit().await?;
+
     Ok(StatusCode::CREATED)
 }
 
-#[derive(Serialize)]
-struct ChargeRes {
-    id: String,
-    amount: i32,
-    campaign: ChargeCampaign,
-    #[serde(serialize_with = "serialize_dt")]
-    created_at: NaiveDateTime,
-}
-
-#[derive(Serialize)]
-struct ChargeCampaign {
-    id: String,
-    name: String,
-    price: i32,
-}
+// ── Charges ──
 
 async fn list_charges(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
-) -> Result<Response, AppError> {
+) -> Result<Json<Vec<ChargeRes>>, AppError> {
     let user_id_s = user_id.to_string();
-    if let Some(body) = state.cache.charges_json.read().await.get(&user_id_s).cloned() {
-        return Ok(response_from_json_bytes(body));
-    }
-
-    let rows: Vec<(String, NaiveDateTime, String, String, i32)> = sqlx::query_as(
-        "SELECT ch.id, ch.created_at, c.id, c.name, c.price \
-         FROM charges ch \
-         JOIN campaign_participants cp ON ch.campaign_participant_id = cp.id \
-         JOIN campaigns c ON cp.campaign_id = c.id \
-         WHERE cp.user_id = ? \
-         ORDER BY ch.created_at DESC",
-    )
-    .bind(&user_id_s)
-    .fetch_all(&state.pool)
-    .await?;
-    let res: Vec<ChargeRes> = rows
-        .into_iter()
-        .map(|(id, ca, cid, name, price)| ChargeRes {
-            id,
-            amount: price,
-            campaign: ChargeCampaign {
-                id: cid,
-                name,
-                price,
-            },
-            created_at: ca,
-        })
-        .collect();
-    let body = serialize_json(&res)?;
-    state.cache.charges_json.write().await.insert(user_id_s, body.clone());
-    Ok(response_from_json_bytes(body))
-}
-
-async fn hydrate_campaign(
-    conn: &mut sqlx::MySqlConnection,
-    id: &str,
-) -> Result<Option<CampaignRes>, AppError> {
-    let row = sqlx::query(
-        "SELECT id, name, description, price, goal_count, created_at \
-         FROM campaigns WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(&mut *conn)
-    .await?;
-    let row = match row {
-        Some(r) => r,
-        None => return Ok(None),
-    };
-
-    let id: String = row.try_get("id")?;
-    let name: String = row.try_get("name")?;
-    let description: String = row.try_get("description")?;
-    let price: i32 = row.try_get("price")?;
-    let goal_count: i32 = row.try_get("goal_count")?;
-    let created_at: NaiveDateTime = row.try_get("created_at")?;
-
-    let tag_rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT t.name FROM campaign_tags ct JOIN tags t ON ct.tag_id = t.id WHERE ct.campaign_id = ?",
-    )
-    .bind(&id)
-    .fetch_all(&mut *conn)
-    .await?;
-    let tags: Vec<String> = tag_rows.into_iter().map(|(n,)| n).collect();
-
-    let part_rows: Vec<(String, String, NaiveDateTime)> = sqlx::query_as(
-        "SELECT cp.user_id, u.name, cp.created_at \
-         FROM campaign_participants cp JOIN users u ON cp.user_id = u.id \
-         WHERE cp.campaign_id = ? ORDER BY cp.created_at ASC",
-    )
-    .bind(&id)
-    .fetch_all(&mut *conn)
-    .await?;
-    let participants: Vec<ParticipantRes> = part_rows
-        .into_iter()
-        .map(|(uid, n, t)| ParticipantRes {
-            user_id: uid,
-            name: n,
-            joined_at: t,
-        })
-        .collect();
-
-    let current_count = participants.len() as i32;
-    let last_joined_at = participants.last().map(|p| p.joined_at);
-    let status = if current_count >= goal_count {
-        "closed"
-    } else {
-        "open"
-    };
-
-    Ok(Some(CampaignRes {
-        id,
-        name,
-        description,
-        price,
-        goal_count,
-        current_count,
-        tags,
-        status: status.to_string(),
-        created_at,
-        last_joined_at,
-        participants,
-    }))
-}
-
-async fn hydrate_campaign_via_pool(
-    pool: &MySqlPool,
-    id: &str,
-) -> Result<Option<CampaignRes>, AppError> {
-    let mut conn = pool.acquire().await?;
-    hydrate_campaign(&mut conn, id).await
+    let charges = state.store.charges.read().await;
+    let user_charges = charges.get(&user_id_s).cloned().unwrap_or_default();
+    let res: Vec<ChargeRes> = user_charges.into_iter().map(|c| ChargeRes {
+        id: c.id, amount: c.amount,
+        campaign: ChargeCampaign { id: c.campaign_id, name: c.campaign_name, price: c.campaign_price },
+        created_at: c.created_at,
+    }).collect();
+    Ok(Json(res))
 }
