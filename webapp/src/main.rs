@@ -18,6 +18,38 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::mpsc;
+
+enum DbWrite {
+    Join {
+        participant_id: String,
+        campaign_id: String,
+        user_id: String,
+        created_at: NaiveDateTime,
+        close_participant_ids: Option<Vec<String>>,
+    },
+    CreateCampaign {
+        id: String,
+        name: String,
+        description: String,
+        price: i32,
+        goal_count: i32,
+        image: Vec<u8>,
+        created_at: NaiveDateTime,
+        tag_ids: Vec<String>,
+    },
+    CreateUser {
+        id: String,
+        name: String,
+        credit_limit: i32,
+        created_at: NaiveDateTime,
+    },
+    CreateSavedSearch {
+        id: String,
+        user_id: String,
+        tag_ids: Vec<String>,
+        created_at: NaiveDateTime,
+    },
+}
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -34,6 +66,7 @@ struct AppState {
     db: Arc<DbConn>,
     store: Arc<Store>,
     webhook_tx: mpsc::Sender<WebhookMessage>,
+    db_tx: mpsc::Sender<DbWrite>,
     replica_urls: Arc<Vec<String>>,
     http: reqwest::Client,
 }
@@ -449,8 +482,10 @@ async fn main() {
         .unwrap_or_else(|_| image_dir.join("seed"));
 
     let (webhook_tx, webhook_rx) = mpsc::channel(8192);
+    let (db_tx, db_rx) = mpsc::channel(8192);
     let http = reqwest::Client::new();
     tokio::spawn(webhook_worker(http.clone(), webhook_rx));
+    tokio::spawn(db_write_worker(pool.clone(), db_rx));
 
     let replica_urls: Vec<String> = std::env::var("REPLICA_URLS")
         .unwrap_or_default()
@@ -469,6 +504,7 @@ async fn main() {
         db: Arc::new(db),
         store,
         webhook_tx,
+        db_tx,
         replica_urls: Arc::new(replica_urls),
         http,
     };
@@ -535,6 +571,58 @@ async fn webhook_worker(http: reqwest::Client, mut rx: mpsc::Receiver<WebhookMes
         if let Err(e) = http.post(&msg.url).json(&msg.body).send().await {
             eprintln!("webhook send to {}: {e}", msg.url);
         }
+    }
+}
+
+async fn db_write_worker(pool: MySqlPool, mut rx: mpsc::Receiver<DbWrite>) {
+    while let Some(write) = rx.recv().await {
+        let r: Result<(), sqlx::Error> = async {
+            match write {
+                DbWrite::Join { participant_id, campaign_id, user_id, created_at, close_participant_ids } => {
+                    let mut tx = pool.begin().await?;
+                    sqlx::query("INSERT INTO campaign_participants (id, campaign_id, user_id, created_at) VALUES (?, ?, ?, ?)")
+                        .bind(&participant_id).bind(&campaign_id).bind(&user_id).bind(created_at)
+                        .execute(&mut *tx).await?;
+                    if let Some(pids) = close_participant_ids {
+                        for pid in pids {
+                            sqlx::query("INSERT INTO charges (id, campaign_participant_id, created_at) VALUES (?, ?, ?)")
+                                .bind(Uuid::new_v4().to_string()).bind(pid).bind(created_at)
+                                .execute(&mut *tx).await?;
+                        }
+                    }
+                    tx.commit().await?;
+                }
+                DbWrite::CreateCampaign { id, name, description, price, goal_count, image, created_at, tag_ids } => {
+                    let mut tx = pool.begin().await?;
+                    sqlx::query("INSERT INTO campaigns (id, name, description, price, goal_count, image, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+                        .bind(&id).bind(&name).bind(&description).bind(price).bind(goal_count).bind(&image).bind(created_at)
+                        .execute(&mut *tx).await?;
+                    for tid in &tag_ids {
+                        sqlx::query("INSERT INTO campaign_tags (campaign_id, tag_id, created_at) VALUES (?, ?, ?)")
+                            .bind(&id).bind(tid).bind(created_at).execute(&mut *tx).await?;
+                    }
+                    tx.commit().await?;
+                }
+                DbWrite::CreateUser { id, name, credit_limit, created_at } => {
+                    sqlx::query("INSERT INTO users (id, name, credit_limit, created_at) VALUES (?, ?, ?, ?)")
+                        .bind(&id).bind(&name).bind(credit_limit).bind(created_at)
+                        .execute(&pool).await?;
+                }
+                DbWrite::CreateSavedSearch { id, user_id, tag_ids, created_at } => {
+                    let mut tx = pool.begin().await?;
+                    sqlx::query("INSERT INTO saved_searches (id, user_id, created_at) VALUES (?, ?, ?)")
+                        .bind(&id).bind(&user_id).bind(created_at)
+                        .execute(&mut *tx).await?;
+                    for tid in &tag_ids {
+                        sqlx::query("INSERT INTO saved_search_tags (saved_search_id, tag_id, created_at) VALUES (?, ?, ?)")
+                            .bind(&id).bind(tid).bind(created_at).execute(&mut *tx).await?;
+                    }
+                    tx.commit().await?;
+                }
+            }
+            Ok(())
+        }.await;
+        if let Err(e) = r { eprintln!("db write-behind: {e}"); }
     }
 }
 
@@ -742,9 +830,9 @@ async fn create_user(
     let now = now_naive();
     let credit_limit = DEFAULT_CREDIT_LIMIT;
 
-    sqlx::query("INSERT INTO users (id, name, credit_limit, created_at) VALUES (?, ?, ?, ?)")
-        .bind(&id).bind(&req.name).bind(credit_limit).bind(now)
-        .execute(&state.pool).await?;
+    let _ = state.db_tx.try_send(DbWrite::CreateUser {
+        id: id.clone(), name: req.name.clone(), credit_limit, created_at: now,
+    });
 
     state.store.data.write().users.insert(id.clone(), MemUser {
         name: req.name.clone(), credit_limit, open_credit_used: 0,
@@ -972,21 +1060,12 @@ async fn create_campaign(
     let id = Uuid::new_v4().to_string();
     let now = now_naive();
 
-    // DB write (for persistence /追試)
-    let mut tx = state.pool.begin().await?;
-    sqlx::query(
-        "INSERT INTO campaigns (id, name, description, price, goal_count, image, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&id).bind(&req.name).bind(&req.description).bind(req.price)
-    .bind(req.goal_count).bind(&image_bytes).bind(now)
-    .execute(&mut *tx).await?;
-    for tid in &tag_ids {
-        sqlx::query("INSERT INTO campaign_tags (campaign_id, tag_id, created_at) VALUES (?, ?, ?)")
-            .bind(&id).bind(tid).bind(now)
-            .execute(&mut *tx).await?;
-    }
-    tx.commit().await?;
+    // Async DB write-behind
+    let _ = state.db_tx.try_send(DbWrite::CreateCampaign {
+        id: id.clone(), name: req.name.clone(), description: req.description.clone(),
+        price: req.price, goal_count: req.goal_count, image: image_bytes.clone(),
+        created_at: now, tag_ids: tag_ids.clone(),
+    });
 
     let camp = MemCampaign {
         name: req.name, description: req.description, price: req.price,
@@ -1150,25 +1229,19 @@ async fn join_campaign(
         broadcast_sync(&state, &event).await;
     }
 
-    // Synchronous DB write (for persistence / 追試). Lock already released.
+    // Async DB write-behind via dedicated worker (no DB wait in response path)
+    let close_pids = if after == goal_count {
+        let d = state.store.data.read();
+        let camp = d.campaigns.get(&campaign_id);
+        camp.map(|c| c.participant_user_ids.iter().cloned().collect::<Vec<_>>())
+    } else { None };
+    // participant_id needs to be stored in memory too for DB charges
     let participant_id = Uuid::new_v4().to_string();
-    let mut tx = state.pool.begin().await?;
-    sqlx::query(
-        "INSERT INTO campaign_participants (id, campaign_id, user_id, created_at) VALUES (?, ?, ?, ?)",
-    ).bind(&participant_id).bind(&campaign_id).bind(&user_id_s).bind(now)
-        .execute(&mut *tx).await?;
-    if after == goal_count {
-        let parts: Vec<(String,)> = sqlx::query_as(
-            "SELECT id FROM campaign_participants WHERE campaign_id = ?",
-        ).bind(&campaign_id).fetch_all(&mut *tx).await?;
-        for (pid,) in parts {
-            sqlx::query(
-                "INSERT INTO charges (id, campaign_participant_id, created_at) VALUES (?, ?, ?)",
-            ).bind(Uuid::new_v4().to_string()).bind(pid).bind(now)
-                .execute(&mut *tx).await?;
-        }
-    }
-    tx.commit().await?;
+    let _ = state.db_tx.try_send(DbWrite::Join {
+        participant_id, campaign_id: campaign_id.clone(),
+        user_id: user_id_s.clone(), created_at: now,
+        close_participant_ids: close_pids,
+    });
 
     // Webhooks
     if !webhook_user_ids.is_empty() && !webhook_url.is_empty() {
@@ -1230,20 +1303,12 @@ async fn create_saved_search(
         tag_id_vec = ids;
     }
 
-    // Synchronous DB write (for persistence / 追試)
+    // Async DB write-behind
     let ss_id = Uuid::new_v4().to_string();
     let now = now_naive();
-    let mut tx = state.pool.begin().await?;
-    sqlx::query("INSERT INTO saved_searches (id, user_id, created_at) VALUES (?, ?, ?)")
-        .bind(&ss_id).bind(&user_id_s).bind(now)
-        .execute(&mut *tx).await?;
-    for tid in &tag_id_vec {
-        sqlx::query(
-            "INSERT INTO saved_search_tags (saved_search_id, tag_id, created_at) VALUES (?, ?, ?)",
-        ).bind(&ss_id).bind(tid).bind(now)
-            .execute(&mut *tx).await?;
-    }
-    tx.commit().await?;
+    let _ = state.db_tx.try_send(DbWrite::CreateSavedSearch {
+        id: ss_id, user_id: user_id_s.clone(), tag_ids: tag_id_vec.clone(), created_at: now,
+    });
 
     let event = SyncEvent::SavedSearchCreated {
         user_id: user_id_s, tag_ids: tag_id_vec.into_iter().collect(),
