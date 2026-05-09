@@ -546,3 +546,5 @@ perf の上位 5% が malloc/cfree だった。Arc 化、&'static str 化、ス�
 single authority + parking_lot::RwLock + ゼロアロケーション + AI 駆動の高速サイクルという戦略は、2vCPU 1台で 21.9M という数字で証明できた。
 
 ソロ参加、AI Agent 全力活用で、20チーム中2位。十分に戦えた。
+
+ちなみに、この参戦記自体も Claude Code (Opus 4.6) が書いている。`ah` (Agent History CLI) でセッション履歴を掘り起こし、git log からコミットを追い、GPT-5.5 Pro (Oracle) にリライトさせ、人間が事実確認して修正した。コードも、分析も、ブログも AI。人間がやったのは「それ嘘だから直して」と言うことだけだった。
