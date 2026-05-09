@@ -43,6 +43,23 @@ AI との協働で一番効いたのは、**失敗を前提にした試行回数
 
 （→ Codex へ。開始直後、まず Codex にコードの全体像を説明させた。API 仕様、DB スキーマ、認証方式を把握してから手を付ける。）
 
+**全体設計プランの策定**
+
+> このwebappの全エンドポイントとその機能を.plansにかきだして
+
+（→ Claude Code へ。エンドポイント一覧を整理させた後、`.plans/webapp-theoretical-fastest-plan.md` という「理論上最速化プラン」を作らせた。515行、Phase 1〜8 に分けた段階的な設計書で、以下が骨子:
+
+1. DB index追加 + SQL集約（安全なベースライン引き上げ）
+2. アプリ内 read-through cache
+3. **全データ RAM 化（initialize 時にDB→メモリ、以降 DB 読み取りゼロ）**
+4. join のロック最適化（user/campaign 単位の shard lock）
+5. seed.sql の事前変換（bincode/rkyv snapshot）
+6. nginx topology 固定
+7. JSON allocation 削減
+8. webhook 非同期化
+
+このプランがその後の全作業の骨格になった。実際には Phase 3（フル in-memory ストア）の実装がスコアを一気に押し上げ、Phase 4 の shard lock は DashMap 化のリスクが高く最終的に見送った。プランどおりに進んだ部分と、計測結果を見て方針を変えた部分の両方がある。）
+
 **ログ分析の委任**
 
 > のこされたログからalp, slowquery分析して
