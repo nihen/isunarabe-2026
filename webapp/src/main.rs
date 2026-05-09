@@ -105,7 +105,6 @@ struct WebhookMessage {
 struct Store {
     data: parking_lot::RwLock<StoreData>,
     user_ids: parking_lot::RwLock<HashSet<String>>,
-    me_cache: parking_lot::RwLock<HashMap<String, Bytes>>,
     // Async-safe for image I/O
     campaign_image: tokio::sync::RwLock<HashMap<String, ImageCache>>,
     // Pre-computed list responses (rebuilt on join/create, not on every list request)
@@ -125,6 +124,7 @@ struct StoreData {
     charges: HashMap<String, Vec<ChargeEntry>>,
     charges_cache: HashMap<String, Bytes>,
     webhook_url: String,
+    me_cache: HashMap<String, Bytes>,
 }
 
 #[derive(Clone)]
@@ -146,7 +146,7 @@ struct MemCampaign {
     tag_ids: Vec<String>,
     participants: Vec<Arc<ParticipantRes>>,
     participant_user_ids: HashSet<String>,
-    status: &'static str,
+    status: String,
     last_joined_at: Option<NaiveDateTime>,
 }
 
@@ -248,9 +248,9 @@ impl Store {
                 charges: HashMap::new(),
                 charges_cache: HashMap::new(),
                 webhook_url: String::new(),
+                me_cache: HashMap::new(),
             }),
             user_ids: parking_lot::RwLock::new(HashSet::new()),
-            me_cache: parking_lot::RwLock::new(HashMap::new()),
             campaign_image: tokio::sync::RwLock::new(HashMap::new()),
             list_cache_dirty: parking_lot::RwLock::new(true),
             list_cache: parking_lot::RwLock::new(HashMap::new()),
@@ -293,7 +293,7 @@ impl Store {
                 price, goal_count, created_at,
                 tags: Arc::from(Vec::new().as_slice()), tag_ids: Vec::new(),
                 participants: Vec::new(), participant_user_ids: HashSet::new(),
-                status: "open", last_joined_at: None,
+                status: "open".to_string(), last_joined_at: None,
             });
         }
 
@@ -336,7 +336,7 @@ impl Store {
         // Finalize campaign status + compute open_credit_used
         for (_, camp) in campaigns.iter_mut() {
             if camp.current_count() >= camp.goal_count {
-                camp.status = "closed";
+                camp.status = "closed".to_string();
             }
         }
         for (_cid, camp) in &campaigns {
@@ -412,9 +412,9 @@ impl Store {
         *self.data.write() = StoreData {
             users, campaigns, tags_cache, tag_id_by_name, tag_name_by_id,
             saved_searches, charges, charges_cache, webhook_url,
+            me_cache: HashMap::new(),
         };
         *self.user_ids.write() = user_id_set;
-        self.me_cache.write().clear();
 
         // Clear image cache (will warm lazily)
         self.campaign_image.write().await.clear();
@@ -496,7 +496,7 @@ impl Store {
         let bytes = Bytes::from(serde_json::to_vec(&camp.to_response(campaign_id)).unwrap_or_default());
         self.campaign_json_cache.write()
             .insert(campaign_id.to_string(), bytes);
-        *self.list_cache_dirty.write() = true;
+        self.list_cache.write().clear();
     }
 }
 
@@ -949,19 +949,18 @@ async fn get_me(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Response, AppError> {
-    // me_cache is separate from data lock — cache hit needs no data lock
-    if let Some(cached) = state.store.me_cache.read().get(&user_id).cloned() {
-        return Ok(response_from_json_bytes(cached));
-    }
-    // Cache miss: read user data, serialize, insert into separate me_cache
+    // Single read lock: check cache + build on miss
     let d = state.store.data.read();
+    if let Some(cached) = d.me_cache.get(&user_id) {
+        return Ok(response_from_json_bytes(cached.clone()));
+    }
     let user = d.users.get(&user_id).ok_or(AppError::Unauthorized)?;
-    let (name, credit_limit, credit_used) = (user.name.clone(), user.credit_limit, user.open_credit_used);
-    drop(d);
     let bytes = Bytes::from(serde_json::to_vec(&MeRes {
-        id: user_id.clone(), name, credit_limit, credit_used,
+        id: user_id.clone(), name: user.name.clone(),
+        credit_limit: user.credit_limit, credit_used: user.open_credit_used,
     }).map_err(|e| AppError::Internal(format!("json: {e}")))?);
-    state.store.me_cache.write().insert(user_id, bytes.clone());
+    drop(d);
+    state.store.data.write().me_cache.insert(user_id, bytes.clone());
     Ok(response_from_json_bytes(bytes))
 }
 
@@ -1012,9 +1011,6 @@ async fn list_campaigns(
 
     tag_ids.sort();
     let cache_key = format!("sort={sort_mode};tags={}", tag_ids.join(","));
-
-    // Rebuild full cache if dirty (new campaign created)
-    state.store.rebuild_list_cache_if_dirty();
 
     // Check cache
     if let Some(body) = state.store.list_cache.read().get(&cache_key).cloned() {
@@ -1176,7 +1172,7 @@ async fn create_campaign(
         price: req.price, goal_count: req.goal_count, created_at: now,
         tags: Arc::from(req.tags.as_slice()), tag_ids,
         participants: Vec::new(), participant_user_ids: HashSet::new(),
-        status: "open", last_joined_at: None,
+        status: "open".to_string(), last_joined_at: None,
     };
     let res = camp.to_response(&id);
     let camp_clone = camp.clone();
@@ -1222,6 +1218,7 @@ async fn join_campaign(
         // Phase 1: Validation (immutable borrows, all dropped at end of phase)
         let price;
         let goal_count;
+        let camp_tag_ids: HashSet<String>;
         let user_name;
         {
             let camp = d.campaigns.get(&campaign_id).ok_or(AppError::NotFound)?;
@@ -1235,6 +1232,7 @@ async fn join_campaign(
 
             price = camp.price;
             goal_count = camp.goal_count;
+            camp_tag_ids = camp.tag_ids.iter().cloned().collect();
             user_name = user.name.clone();
         }
 
@@ -1248,33 +1246,26 @@ async fn join_campaign(
         let after = camp.current_count();
 
         d.users.get_mut(&user_id_s).unwrap().open_credit_used += price;
-        state.store.me_cache.write().remove(&user_id_s);
+        d.me_cache.remove(&user_id_s);
 
         // Campaign close (mutations)
         if after == goal_count {
             let camp = d.campaigns.get_mut(&campaign_id).unwrap();
-            camp.status = "closed";
+            camp.status = "closed".to_string();
             let participant_uids: Vec<String> = camp.participant_user_ids.iter().cloned().collect();
             let camp_name = camp.name.to_string();
             for uid in &participant_uids {
                 if let Some(u) = d.users.get_mut(uid) {
                     u.open_credit_used -= price;
                 }
-                state.store.me_cache.write().remove(uid);
+                d.me_cache.remove(uid);
                 let charge = ChargeEntry {
                     id: Uuid::new_v4().to_string(), amount: price,
                     campaign_id: campaign_id.clone(), campaign_name: camp_name.clone(),
                     campaign_price: price, created_at: now,
                 };
                 d.charges.entry(uid.clone()).or_default().insert(0, charge);
-                // Rebuild charges cache inline to avoid write lock in list_charges
-                let user_charges = d.charges.get(uid).unwrap();
-                let res: Vec<ChargeRes> = user_charges.iter().map(|c| ChargeRes {
-                    id: c.id.clone(), amount: c.amount,
-                    campaign: ChargeCampaign { id: c.campaign_id.clone(), name: c.campaign_name.clone(), price: c.campaign_price },
-                    created_at: c.created_at,
-                }).collect();
-                d.charges_cache.insert(uid.clone(), Bytes::from(serde_json::to_vec(&res).unwrap_or_default()));
+                d.charges_cache.remove(uid);
             }
         }
 
@@ -1285,8 +1276,6 @@ async fn join_campaign(
 
         let mut webhook_user_ids: Vec<String> = Vec::new();
         if after == goal_count - 1 {
-            let camp = d.campaigns.get(&campaign_id).unwrap();
-            let camp_tag_ids: HashSet<String> = camp.tag_ids.iter().cloned().collect();
             let mut seen = HashSet::new();
             for (uid, searches) in d.saved_searches.iter() {
                 for search in searches {
@@ -1315,18 +1304,8 @@ async fn join_campaign(
     // Update caches — reuse serialized bytes
     state.store.campaign_json_cache.write()
         .insert(campaign_id.clone(), response_bytes.clone());
-    if after == goal_count {
-        // Differential update: remove closed campaign from cached list entries
-        let needle = campaign_id.as_str();
-        let mut cache = state.store.list_cache.write();
-        for (_, bytes) in cache.iter_mut() {
-            if bytes.windows(needle.len()).any(|w| w == needle.as_bytes()) {
-                if let Ok(mut list) = serde_json::from_slice::<Vec<serde_json::Value>>(bytes) {
-                    list.retain(|c| c.get("id").and_then(|v| v.as_str()) != Some(needle));
-                    *bytes = Bytes::from(serde_json::to_vec(&list).unwrap_or_default());
-                }
-            }
-        }
+    if !LIST_CACHE_AGGRESSIVE.load(Ordering::Relaxed) || after == goal_count {
+        state.store.list_cache.write().clear();
     }
 
     // Sync to replicas (skip construction if no replicas)
@@ -1436,11 +1415,31 @@ async fn list_charges(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Response, AppError> {
-    let d = state.store.data.read();
-    if let Some(cached) = d.charges_cache.get(&user_id) {
-        return Ok(response_from_json_bytes(cached.clone()));
+    {
+        let d = state.store.data.read();
+        if let Some(cached) = d.charges_cache.get(&user_id) {
+            return Ok(response_from_json_bytes(cached.clone()));
+        }
+        if !d.charges.contains_key(&user_id) {
+            return Ok(response_from_json_bytes(Bytes::from_static(b"[]")));
+        }
     }
-    Ok(response_from_json_bytes(Bytes::from_static(b"[]")))
+    let mut d = state.store.data.write();
+    let entries = d.charges.get(&user_id);
+    let bytes = match entries {
+        Some(entries) => {
+            let res: Vec<ChargeRes> = entries.iter().map(|c| ChargeRes {
+                id: c.id.clone(), amount: c.amount,
+                campaign: ChargeCampaign { id: c.campaign_id.clone(), name: c.campaign_name.clone(), price: c.campaign_price },
+                created_at: c.created_at,
+            }).collect();
+            Bytes::from(serde_json::to_vec(&res).unwrap_or_default())
+        }
+        None => Bytes::from_static(b"[]"),
+    };
+    d.charges_cache.insert(user_id, bytes.clone());
+    drop(d);
+    Ok(response_from_json_bytes(bytes))
 }
 
 // ── Internal sync ──
@@ -1472,7 +1471,7 @@ async fn apply_sync_event(state: &AppState, event: SyncEvent) -> Result<(), AppE
                 price, goal_count, created_at,
                 tags: Arc::from(tags.as_slice()), tag_ids,
                 participants: Vec::new(), participant_user_ids: HashSet::new(),
-                status: "open", last_joined_at: None,
+                status: "open".to_string(), last_joined_at: None,
             };
             state.store.invalidate_campaign(&id, &camp);
             state.store.data.write().campaigns.insert(id, camp);
@@ -1497,7 +1496,7 @@ async fn apply_sync_event(state: &AppState, event: SyncEvent) -> Result<(), AppE
                             need_credit_add = true;
                         }
                         if closed {
-                            camp.status = "closed";
+                            camp.status = "closed".to_string();
                         }
                     }
                 }
@@ -1507,14 +1506,14 @@ async fn apply_sync_event(state: &AppState, event: SyncEvent) -> Result<(), AppE
                     if let Some(u) = d.users.get_mut(&user_id) {
                         u.open_credit_used += price;
                     }
-                    state.store.me_cache.write().remove(&user_id);
+                    d.me_cache.remove(&user_id);
                 }
                 if closed {
                     for uid in &close_participant_ids {
                         if let Some(u) = d.users.get_mut(uid) {
                             u.open_credit_used -= price;
                         }
-                        state.store.me_cache.write().remove(uid);
+                        d.me_cache.remove(uid);
                     }
                 }
 
