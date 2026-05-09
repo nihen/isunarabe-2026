@@ -779,13 +779,73 @@ async fn warm_read_cache(state: &AppState) -> Result<(), AppError> {
     *state.cache.tags_json.write().await = Some(serialize_json(&tags)?);
     *state.cache.tag_ids_by_name.write().await = tag_ids_by_name.clone();
 
-    let user_rows: Vec<(String,)> = sqlx::query_as("SELECT id FROM users")
-        .fetch_all(&state.pool)
-        .await?;
+    let user_rows: Vec<(String, String, i32)> =
+        sqlx::query_as("SELECT id, name, credit_limit FROM users")
+            .fetch_all(&state.pool)
+            .await?;
     *state.cache.user_ids.write().await = user_rows
-        .into_iter()
-        .map(|(id,)| id)
+        .iter()
+        .map(|(id, _, _)| id.clone())
         .collect::<HashSet<_>>();
+
+    let credit_rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT cp.user_id, CAST(COALESCE(SUM(c.price), 0) AS SIGNED) \
+         FROM campaign_participants cp \
+         JOIN campaigns c ON c.id = cp.campaign_id \
+         JOIN ( \
+             SELECT campaign_id, COUNT(*) AS current_count \
+             FROM campaign_participants \
+             GROUP BY campaign_id \
+         ) cc ON cc.campaign_id = c.id \
+         WHERE cc.current_count < c.goal_count \
+         GROUP BY cp.user_id",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let credit_by_user: HashMap<String, i64> = credit_rows.into_iter().collect();
+    let mut me_json = HashMap::with_capacity(user_rows.len());
+    for (id, name, credit_limit) in &user_rows {
+        let credit_used = credit_by_user.get(id).copied().unwrap_or(0) as i32;
+        let me = MeRes {
+            id: id.clone(),
+            name: name.clone(),
+            credit_limit: *credit_limit,
+            credit_used,
+        };
+        me_json.insert(id.clone(), serialize_json(&me)?);
+    }
+    *state.cache.me_json.write().await = me_json;
+
+    let charge_rows: Vec<(String, String, NaiveDateTime, String, String, i32)> = sqlx::query_as(
+        "SELECT cp.user_id, ch.id, ch.created_at, c.id, c.name, c.price \
+         FROM charges ch \
+         JOIN campaign_participants cp ON ch.campaign_participant_id = cp.id \
+         JOIN campaigns c ON cp.campaign_id = c.id \
+         ORDER BY ch.created_at DESC",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let mut charges_by_user: HashMap<String, Vec<ChargeRes>> = user_rows
+        .iter()
+        .map(|(id, _, _)| (id.clone(), Vec::new()))
+        .collect();
+    for (user_id, id, created_at, campaign_id, name, price) in charge_rows {
+        charges_by_user.entry(user_id).or_default().push(ChargeRes {
+            id,
+            amount: price,
+            campaign: ChargeCampaign {
+                id: campaign_id,
+                name,
+                price,
+            },
+            created_at,
+        });
+    }
+    let mut charges_json = HashMap::with_capacity(charges_by_user.len());
+    for (user_id, charges) in charges_by_user {
+        charges_json.insert(user_id, serialize_json(&charges)?);
+    }
+    *state.cache.charges_json.write().await = charges_json;
 
     let rows: Vec<(
         String,
