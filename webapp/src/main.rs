@@ -53,8 +53,6 @@ struct WebhookMessage {
 
 #[derive(Default)]
 struct AppCache {
-    user_ids: RwLock<HashSet<String>>,
-    tag_ids_by_name: RwLock<HashMap<String, String>>,
     tags_json: RwLock<Option<Arc<Vec<u8>>>>,
     campaign_json: RwLock<HashMap<String, Arc<Vec<u8>>>>,
     campaign_image: RwLock<HashMap<String, ImageCache>>,
@@ -71,8 +69,6 @@ struct ImageCache {
 
 impl AppCache {
     async fn clear_all(&self) {
-        self.user_ids.write().await.clear();
-        self.tag_ids_by_name.write().await.clear();
         *self.tags_json.write().await = None;
         self.campaign_json.write().await.clear();
         self.campaign_image.write().await.clear();
@@ -95,10 +91,6 @@ impl AppCache {
             me_json.remove(user_id);
             charges_json.remove(user_id);
         }
-    }
-
-    async fn insert_user(&self, user_id: String) {
-        self.user_ids.write().await.insert(user_id);
     }
 }
 
@@ -282,20 +274,13 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .ok_or(AppError::Unauthorized)?;
     let user_id = Uuid::parse_str(header).map_err(|_| AppError::Unauthorized)?;
-    let user_id_s = user_id.to_string();
-    if state.cache.user_ids.read().await.contains(&user_id_s) {
-        req.extensions_mut().insert(AuthUser(user_id));
-        return Ok(next.run(req).await);
-    }
-
     let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM users WHERE id = ?")
-        .bind(&user_id_s)
+        .bind(user_id.to_string())
         .fetch_optional(&state.pool)
         .await?;
     if exists.is_none() {
         return Err(AppError::Unauthorized);
     }
-    state.cache.insert_user(user_id_s).await;
     req.extensions_mut().insert(AuthUser(user_id));
     Ok(next.run(req).await)
 }
@@ -461,7 +446,6 @@ async fn create_user(
         .bind(now)
         .execute(&state.pool)
         .await?;
-    state.cache.insert_user(id.clone()).await;
     Ok(Json(UserRes {
         id,
         name: req.name,
@@ -524,48 +508,17 @@ async fn fetch_open_credit_used(pool: &MySqlPool, user_id: &str) -> Result<i64, 
     Ok(credit_used)
 }
 
-async fn resolve_tag_ids(state: &AppState, tag_names: &[String]) -> Result<Vec<String>, AppError> {
-    let cached = state.cache.tag_ids_by_name.read().await;
-    if !cached.is_empty() {
-        let mut tag_ids = Vec::with_capacity(tag_names.len());
-        for name in tag_names {
-            let tag_id = cached.get(name).ok_or(AppError::BadRequest)?;
-            tag_ids.push(tag_id.clone());
-        }
-        return Ok(tag_ids);
-    }
-    drop(cached);
-
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, id FROM tags")
-        .fetch_all(&state.pool)
-        .await?;
-    let tag_ids_by_name: HashMap<String, String> = rows.into_iter().collect();
-    let mut tag_ids = Vec::with_capacity(tag_names.len());
-    for name in tag_names {
-        let tag_id = tag_ids_by_name.get(name).ok_or(AppError::BadRequest)?;
-        tag_ids.push(tag_id.clone());
-    }
-    *state.cache.tag_ids_by_name.write().await = tag_ids_by_name.clone();
-    Ok(tag_ids)
-}
-
 async fn list_tags(State(state): State<AppState>) -> Result<Response, AppError> {
     if let Some(body) = state.cache.tags_json.read().await.clone() {
         return Ok(response_from_json_bytes(body));
     }
 
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, id FROM tags")
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM tags")
         .fetch_all(&state.pool)
         .await?;
-    let mut tags = Vec::with_capacity(rows.len());
-    let mut tag_ids_by_name = HashMap::with_capacity(rows.len());
-    for (name, id) in rows {
-        tags.push(name.clone());
-        tag_ids_by_name.insert(name, id);
-    }
+    let tags: Vec<String> = rows.into_iter().map(|(n,)| n).collect();
     let body = serialize_json(&tags)?;
     *state.cache.tags_json.write().await = Some(body.clone());
-    *state.cache.tag_ids_by_name.write().await = tag_ids_by_name.clone();
     Ok(response_from_json_bytes(body))
 }
 
@@ -591,7 +544,16 @@ async fn list_campaigns(
                     return Err(AppError::BadRequest);
                 }
             }
-            resolve_tag_ids(&state, &parts).await?
+            let mut tag_ids = Vec::with_capacity(parts.len());
+            for p in &parts {
+                let r: Option<(String,)> = sqlx::query_as("SELECT id FROM tags WHERE name = ?")
+                    .bind(p)
+                    .fetch_optional(&state.pool)
+                    .await?;
+                let (tag_id,) = r.ok_or(AppError::BadRequest)?;
+                tag_ids.push(tag_id);
+            }
+            tag_ids
         }
         _ => Vec::new(),
     };
@@ -677,12 +639,7 @@ async fn list_campaigns(
                     goal_count,
                     current_count,
                     tags,
-                    status: if current_count >= goal_count {
-                        "closed"
-                    } else {
-                        "open"
-                    }
-                    .to_string(),
+                    status: if current_count >= goal_count { "closed" } else { "open" }.to_string(),
                     created_at,
                     last_joined_at,
                     participants,
@@ -766,85 +723,11 @@ async fn fetch_participants_by_campaign(
 }
 
 async fn warm_read_cache(state: &AppState) -> Result<(), AppError> {
-    let tag_rows: Vec<(String, String)> = sqlx::query_as("SELECT name, id FROM tags")
+    let tag_rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM tags")
         .fetch_all(&state.pool)
         .await?;
-    let mut tags = Vec::with_capacity(tag_rows.len());
-    let mut tag_ids_by_name = HashMap::with_capacity(tag_rows.len());
-    for (name, id) in tag_rows {
-        tags.push(name.clone());
-        tag_ids_by_name.insert(name, id);
-    }
+    let tags: Vec<String> = tag_rows.into_iter().map(|(name,)| name).collect();
     *state.cache.tags_json.write().await = Some(serialize_json(&tags)?);
-    *state.cache.tag_ids_by_name.write().await = tag_ids_by_name.clone();
-
-    let user_rows: Vec<(String, String, i32)> =
-        sqlx::query_as("SELECT id, name, credit_limit FROM users")
-            .fetch_all(&state.pool)
-            .await?;
-    *state.cache.user_ids.write().await = user_rows
-        .iter()
-        .map(|(id, _, _)| id.clone())
-        .collect::<HashSet<_>>();
-
-    let credit_rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT cp.user_id, CAST(COALESCE(SUM(c.price), 0) AS SIGNED) \
-         FROM campaign_participants cp \
-         JOIN campaigns c ON c.id = cp.campaign_id \
-         JOIN ( \
-             SELECT campaign_id, COUNT(*) AS current_count \
-             FROM campaign_participants \
-             GROUP BY campaign_id \
-         ) cc ON cc.campaign_id = c.id \
-         WHERE cc.current_count < c.goal_count \
-         GROUP BY cp.user_id",
-    )
-    .fetch_all(&state.pool)
-    .await?;
-    let credit_by_user: HashMap<String, i64> = credit_rows.into_iter().collect();
-    let mut me_json = HashMap::with_capacity(user_rows.len());
-    for (id, name, credit_limit) in &user_rows {
-        let credit_used = credit_by_user.get(id).copied().unwrap_or(0) as i32;
-        let me = MeRes {
-            id: id.clone(),
-            name: name.clone(),
-            credit_limit: *credit_limit,
-            credit_used,
-        };
-        me_json.insert(id.clone(), serialize_json(&me)?);
-    }
-    *state.cache.me_json.write().await = me_json;
-
-    let charge_rows: Vec<(String, String, NaiveDateTime, String, String, i32)> = sqlx::query_as(
-        "SELECT cp.user_id, ch.id, ch.created_at, c.id, c.name, c.price \
-         FROM charges ch \
-         JOIN campaign_participants cp ON ch.campaign_participant_id = cp.id \
-         JOIN campaigns c ON cp.campaign_id = c.id \
-         ORDER BY ch.created_at DESC",
-    )
-    .fetch_all(&state.pool)
-    .await?;
-    let mut charges_by_user: HashMap<String, Vec<ChargeRes>> = user_rows
-        .iter()
-        .map(|(id, _, _)| (id.clone(), Vec::new()))
-        .collect();
-    for (user_id, id, created_at, campaign_id, name, price) in charge_rows {
-        charges_by_user.entry(user_id).or_default().push(ChargeRes {
-            id,
-            amount: price,
-            campaign: ChargeCampaign {
-                id: campaign_id,
-                name,
-                price,
-            },
-            created_at,
-        });
-    }
-    let mut charges_json = HashMap::with_capacity(charges_by_user.len());
-    for (user_id, charges) in charges_by_user {
-        charges_json.insert(user_id, serialize_json(&charges)?);
-    }
-    *state.cache.charges_json.write().await = charges_json;
 
     let rows: Vec<(
         String,
@@ -904,12 +787,23 @@ async fn warm_read_cache(state: &AppState) -> Result<(), AppError> {
     }
     *state.cache.campaign_json.write().await = campaign_json;
 
-    let open_campaigns: Vec<CampaignRes> = campaigns
-        .iter()
+    let mut open_campaigns: Vec<CampaignRes> = campaigns
+        .into_iter()
         .filter(|campaign| campaign.status == "open")
-        .cloned()
         .collect();
-    let list_cache = build_warmed_list_cache(&open_campaigns, &tag_ids_by_name)?;
+    open_campaigns.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let latest: Vec<CampaignRes> = open_campaigns.iter().take(30).cloned().collect();
+
+    open_campaigns.sort_by(|a, b| {
+        let ak = a.last_joined_at.unwrap_or(a.created_at);
+        let bk = b.last_joined_at.unwrap_or(b.created_at);
+        bk.cmp(&ak)
+    });
+    let active: Vec<CampaignRes> = open_campaigns.iter().take(30).cloned().collect();
+
+    let mut list_cache = HashMap::new();
+    list_cache.insert("sort=new;tags=".to_string(), serialize_json(&latest)?);
+    list_cache.insert("sort=active;tags=".to_string(), serialize_json(&active)?);
     *state.cache.list_campaigns_json.write().await = list_cache;
 
     let image_rows: Vec<(String, Vec<u8>)> = sqlx::query_as("SELECT id, image FROM campaigns")
@@ -929,90 +823,6 @@ async fn warm_read_cache(state: &AppState) -> Result<(), AppError> {
     *state.cache.campaign_image.write().await = image_cache;
 
     Ok(())
-}
-
-fn build_warmed_list_cache(
-    open_campaigns: &[CampaignRes],
-    tag_ids_by_name: &HashMap<String, String>,
-) -> Result<HashMap<String, Arc<Vec<u8>>>, AppError> {
-    let mut list_cache = HashMap::new();
-    insert_list_cache(&mut list_cache, open_campaigns, &[], &[])?;
-
-    let mut tag_pairs: Vec<(&String, &String)> = tag_ids_by_name.iter().collect();
-    tag_pairs.sort_by(|a, b| a.0.cmp(b.0));
-    for i in 0..tag_pairs.len() {
-        insert_list_cache(
-            &mut list_cache,
-            open_campaigns,
-            &[tag_pairs[i].0.as_str()],
-            &[tag_pairs[i].1.as_str()],
-        )?;
-        for j in i + 1..tag_pairs.len() {
-            insert_list_cache(
-                &mut list_cache,
-                open_campaigns,
-                &[tag_pairs[i].0.as_str(), tag_pairs[j].0.as_str()],
-                &[tag_pairs[i].1.as_str(), tag_pairs[j].1.as_str()],
-            )?;
-            for k in j + 1..tag_pairs.len() {
-                insert_list_cache(
-                    &mut list_cache,
-                    open_campaigns,
-                    &[
-                        tag_pairs[i].0.as_str(),
-                        tag_pairs[j].0.as_str(),
-                        tag_pairs[k].0.as_str(),
-                    ],
-                    &[
-                        tag_pairs[i].1.as_str(),
-                        tag_pairs[j].1.as_str(),
-                        tag_pairs[k].1.as_str(),
-                    ],
-                )?;
-            }
-        }
-    }
-    Ok(list_cache)
-}
-
-fn insert_list_cache(
-    list_cache: &mut HashMap<String, Arc<Vec<u8>>>,
-    open_campaigns: &[CampaignRes],
-    tag_names: &[&str],
-    tag_ids: &[&str],
-) -> Result<(), AppError> {
-    let mut filtered: Vec<CampaignRes> = open_campaigns
-        .iter()
-        .filter(|campaign| {
-            tag_names
-                .iter()
-                .all(|tag_name| campaign.tags.iter().any(|tag| tag == tag_name))
-        })
-        .cloned()
-        .collect();
-
-    filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    let latest: Vec<CampaignRes> = filtered.iter().take(30).cloned().collect();
-    let tag_key = sorted_tag_key(tag_ids);
-    list_cache.insert(format!("sort=new;tags={tag_key}"), serialize_json(&latest)?);
-
-    filtered.sort_by(|a, b| {
-        let ak = a.last_joined_at.unwrap_or(a.created_at);
-        let bk = b.last_joined_at.unwrap_or(b.created_at);
-        bk.cmp(&ak)
-    });
-    let active: Vec<CampaignRes> = filtered.iter().take(30).cloned().collect();
-    list_cache.insert(
-        format!("sort=active;tags={tag_key}"),
-        serialize_json(&active)?,
-    );
-    Ok(())
-}
-
-fn sorted_tag_key(tag_ids: &[&str]) -> String {
-    let mut sorted = tag_ids.to_vec();
-    sorted.sort_unstable();
-    sorted.join(",")
 }
 
 #[derive(Deserialize)]
@@ -1052,7 +862,22 @@ async fn create_campaign(
         }
     }
     let image_bytes = validate_jpeg_image_b64(&req.image)?;
-    let tag_ids = resolve_tag_ids(&state, &req.tags).await?;
+    let mut tag_ids: Vec<String> = Vec::new();
+    for t in &req.tags {
+        let r: Option<(String,)> = sqlx::query_as("SELECT id FROM tags WHERE name = ?")
+            .bind(t)
+            .fetch_optional(&state.pool)
+            .await?;
+        match r {
+            Some((tid,)) => {
+                if tag_ids.iter().any(|id| id == &tid) {
+                    return Err(AppError::BadRequest);
+                }
+                tag_ids.push(tid);
+            }
+            None => return Err(AppError::BadRequest),
+        }
+    }
 
     let id = Uuid::new_v4().to_string();
     let now = now_naive();
@@ -1359,7 +1184,22 @@ async fn create_saved_search(
             return Err(AppError::BadRequest);
         }
     }
-    let tag_ids = resolve_tag_ids(&state, &req.tags).await?;
+    let mut tag_ids: Vec<String> = Vec::new();
+    for t in &req.tags {
+        let r: Option<(String,)> = sqlx::query_as("SELECT id FROM tags WHERE name = ?")
+            .bind(t)
+            .fetch_optional(&state.pool)
+            .await?;
+        match r {
+            Some((tid,)) => {
+                if tag_ids.iter().any(|id| id == &tid) {
+                    return Err(AppError::BadRequest);
+                }
+                tag_ids.push(tid);
+            }
+            None => return Err(AppError::BadRequest),
+        }
+    }
 
     let mut tx = state.pool.begin().await?;
     sqlx::query("SELECT id FROM users WHERE id = ? FOR UPDATE")

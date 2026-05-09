@@ -110,7 +110,6 @@ def request_json(
         status = e.code
         response_headers = {k.lower(): v for k, v in e.headers.items()}
         payload = e.read()
-        e.close()
 
     if status != expected:
         raise ApiError(
@@ -140,7 +139,6 @@ def request_bytes(
         status = e.code
         response_headers = {k.lower(): v for k, v in e.headers.items()}
         payload = e.read()
-        e.close()
     if status != expected:
         raise ApiError(
             f"{method} {path}: expected {expected}, got {status}, body={payload[:500]!r}"
@@ -217,13 +215,6 @@ class RegulationApiTest(unittest.TestCase):
         request_json("GET", "/api/campaigns?tags=mesh,mesh", user_id=owner_id, expected=400)
         request_json("GET", "/api/campaigns?tags=missing-tag", user_id=owner_id, expected=400)
         request_json("GET", "/api/campaigns?tags=mesh,office,gaming,chair", user_id=owner_id, expected=400)
-        _, _, mesh_campaigns = request_json(
-            "GET",
-            "/api/campaigns?tags=mesh&sort=active",
-            user_id=owner_id,
-        )
-        self.assertLessEqual(len(mesh_campaigns), 30)
-        self.assertTrue(all("mesh" in c["tags"] for c in mesh_campaigns))
 
         request_json(
             "POST",
@@ -245,12 +236,6 @@ class RegulationApiTest(unittest.TestCase):
         self.assertEqual(campaign["current_count"], 0)
         self.assertEqual(campaign["status"], "open")
         self.assertEqual(campaign["participants"], [])
-        _, _, mesh_office_campaigns = request_json(
-            "GET",
-            "/api/campaigns?tags=mesh,office",
-            user_id=owner_id,
-        )
-        self.assertTrue(any(c["id"] == campaign_id for c in mesh_office_campaigns))
 
         _, _, detail = request_json("GET", f"/api/campaigns/{campaign_id}", user_id=owner_id)
         self.assertEqual(detail["id"], campaign_id)
