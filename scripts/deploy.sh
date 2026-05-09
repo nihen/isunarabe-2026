@@ -24,7 +24,10 @@ deploy_one() {
 
   echo "[deploy ${host}] cargo build --release"
   ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" \
-    'cd ~/webapp && ~/.cargo/bin/cargo build --release --bin webapp 2>&1 | tail -2'
+    'cd ~/webapp && ~/.cargo/bin/cargo build --release --bin webapp 2>&1 | tail -2 && \
+     cp -f target/release/webapp target/release/webapp.prev 2>/dev/null; \
+     cp target/release/webapp target/release/webapp.new && \
+     mv -f target/release/webapp.new target/release/webapp'
 
   echo "[deploy ${host}] restart"
   ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" "sudo systemctl restart ${SERVICE}"

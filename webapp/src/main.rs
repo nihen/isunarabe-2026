@@ -1227,8 +1227,10 @@ async fn join_campaign(
     // Update caches — reuse serialized bytes
     state.store.campaign_json_cache.write()
         .insert(campaign_id.clone(), response_bytes.clone());
-    // Only clear list cache when campaign closes (not on every join)
-    if after == goal_count {
+    // LIST_CACHE_AGGRESSIVE=1: only clear on close (faster, slightly stale)
+    // unset: clear on every join (safe)
+    let aggressive = std::env::var("LIST_CACHE_AGGRESSIVE").map(|v| v == "1").unwrap_or(false);
+    if !aggressive || after == goal_count {
         state.store.list_cache.write().clear();
     }
 
