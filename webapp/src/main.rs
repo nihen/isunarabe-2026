@@ -1,4 +1,3 @@
-
 use axum::{
     body::Body,
     extract::{FromRequest, Path as AxumPath, Query as AxumQuery, Request, State},
@@ -11,9 +10,10 @@ use axum::{
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::Digest as _;
-use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
+use sqlx::mysql::{MySql, MySqlPool, MySqlPoolOptions};
+use sqlx::QueryBuilder;
 use sqlx::Row;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -22,7 +22,6 @@ use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 const DEFAULT_CREDIT_LIMIT: i32 = 60000;
-
 
 #[derive(Clone)]
 struct AppState {
@@ -43,7 +42,6 @@ struct DbConn {
 
 #[derive(Clone, Copy)]
 struct AuthUser(Uuid);
-
 
 #[tokio::main]
 async fn main() {
@@ -135,7 +133,6 @@ fn parse_db_url(dsn: &str) -> DbConn {
     }
 }
 
-
 #[derive(Debug)]
 enum AppError {
     Unauthorized,
@@ -171,7 +168,6 @@ impl From<sqlx::Error> for AppError {
     }
 }
 
-
 struct JsonReq<T>(T);
 
 #[axum::async_trait]
@@ -190,7 +186,6 @@ where
         Ok(JsonReq(v))
     }
 }
-
 
 async fn auth_middleware(
     State(state): State<AppState>,
@@ -213,7 +208,6 @@ async fn auth_middleware(
     req.extensions_mut().insert(AuthUser(user_id));
     Ok(next.run(req).await)
 }
-
 
 fn now_naive() -> NaiveDateTime {
     Utc::now().naive_utc()
@@ -258,7 +252,6 @@ fn serialize_dt_opt<S: Serializer>(dt: &Option<NaiveDateTime>, s: S) -> Result<S
     }
 }
 
-
 #[derive(Serialize)]
 struct CampaignRes {
     id: String,
@@ -276,14 +269,13 @@ struct CampaignRes {
     participants: Vec<ParticipantRes>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ParticipantRes {
     user_id: String,
     name: String,
     #[serde(serialize_with = "serialize_dt")]
     joined_at: NaiveDateTime,
 }
-
 
 #[derive(Deserialize)]
 struct InitReq {
@@ -402,30 +394,7 @@ async fn get_me(
             .await?;
     let (name, credit_limit) = row.ok_or(AppError::Unauthorized)?;
 
-    let part_rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT campaign_id FROM campaign_participants WHERE user_id = ?",
-    )
-    .bind(user_id.to_string())
-    .fetch_all(&state.pool)
-    .await?;
-    let mut credit_used: i64 = 0;
-    for (cid,) in part_rows {
-        let row = sqlx::query("SELECT price, goal_count FROM campaigns WHERE id = ?")
-            .bind(&cid)
-            .fetch_one(&state.pool)
-            .await?;
-        let price: i32 = row.try_get("price")?;
-        let goal_count: i32 = row.try_get("goal_count")?;
-        let (count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM campaign_participants WHERE campaign_id = ?",
-        )
-        .bind(&cid)
-        .fetch_one(&state.pool)
-        .await?;
-        if (count as i32) < goal_count {
-            credit_used += price as i64;
-        }
-    }
+    let credit_used = fetch_open_credit_used(&state.pool, &user_id.to_string()).await?;
 
     Ok(Json(MeRes {
         id: user_id.to_string(),
@@ -433,6 +402,24 @@ async fn get_me(
         credit_limit,
         credit_used: credit_used as i32,
     }))
+}
+
+async fn fetch_open_credit_used(pool: &MySqlPool, user_id: &str) -> Result<i64, AppError> {
+    let (credit_used,): (i64,) = sqlx::query_as(
+        "SELECT CAST(COALESCE(SUM(c.price), 0) AS SIGNED) \
+         FROM campaign_participants cp \
+         JOIN campaigns c ON c.id = cp.campaign_id \
+         JOIN ( \
+             SELECT campaign_id, COUNT(*) AS current_count \
+             FROM campaign_participants \
+             GROUP BY campaign_id \
+         ) cc ON cc.campaign_id = c.id \
+         WHERE cp.user_id = ? AND cc.current_count < c.goal_count",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(credit_used)
 }
 
 async fn list_tags(State(state): State<AppState>) -> Result<Json<Vec<String>>, AppError> {
@@ -452,7 +439,7 @@ async fn list_campaigns(
     State(state): State<AppState>,
     AxumQuery(q): AxumQuery<ListCampaignsQuery>,
 ) -> Result<Json<Vec<CampaignRes>>, AppError> {
-    let tag_filter: Vec<String> = match q.tags.as_deref() {
+    let tag_ids: Vec<String> = match q.tags.as_deref() {
         Some(s) if !s.is_empty() => {
             let parts: Vec<String> = s.split(',').map(|p| p.to_string()).collect();
             if parts.len() > 3 {
@@ -464,16 +451,16 @@ async fn list_campaigns(
                     return Err(AppError::BadRequest);
                 }
             }
+            let mut tag_ids = Vec::with_capacity(parts.len());
             for p in &parts {
                 let r: Option<(String,)> = sqlx::query_as("SELECT id FROM tags WHERE name = ?")
                     .bind(p)
                     .fetch_optional(&state.pool)
                     .await?;
-                if r.is_none() {
-                    return Err(AppError::BadRequest);
-                }
+                let (tag_id,) = r.ok_or(AppError::BadRequest)?;
+                tag_ids.push(tag_id);
             }
-            parts
+            tag_ids
         }
         _ => Vec::new(),
     };
@@ -484,46 +471,154 @@ async fn list_campaigns(
         _ => return Err(AppError::BadRequest),
     };
 
-    let id_rows: Vec<(String,)> = sqlx::query_as("SELECT id FROM campaigns")
-        .fetch_all(&state.pool)
-        .await?;
-    let mut conn = state.pool.acquire().await?;
-    let mut all: Vec<CampaignRes> = Vec::new();
-    for (cid,) in id_rows {
-        if let Some(c) = hydrate_campaign(&mut conn, &cid).await? {
-            all.push(c);
+    let mut qb = QueryBuilder::<MySql>::new(
+        "SELECT c.id, c.name, c.description, c.price, c.goal_count, c.created_at, \
+         COUNT(cp.id) AS current_count, MAX(cp.created_at) AS last_joined_at \
+         FROM campaigns c \
+         LEFT JOIN campaign_participants cp ON cp.campaign_id = c.id",
+    );
+    if !tag_ids.is_empty() {
+        qb.push(" WHERE c.id IN (SELECT ct.campaign_id FROM campaign_tags ct WHERE ct.tag_id IN (");
+        let mut separated = qb.separated(", ");
+        for tag_id in &tag_ids {
+            separated.push_bind(tag_id);
         }
+        drop(separated);
+        qb.push(") GROUP BY ct.campaign_id HAVING COUNT(DISTINCT ct.tag_id) = ");
+        qb.push_bind(tag_ids.len() as i64);
+        qb.push(")");
     }
-    drop(conn);
-
-    let want: HashSet<&str> = tag_filter.iter().map(|s| s.as_str()).collect();
-    all.retain(|c| {
-        if c.status != "open" {
-            return false;
-        }
-        if !want.is_empty() {
-            let have: HashSet<&str> = c.tags.iter().map(|s| s.as_str()).collect();
-            for w in &want {
-                if !have.contains(w) {
-                    return false;
-                }
-            }
-        }
-        true
-    });
-
+    qb.push(
+        " GROUP BY c.id, c.name, c.description, c.price, c.goal_count, c.created_at \
+         HAVING COUNT(cp.id) < c.goal_count ORDER BY ",
+    );
     if sort_mode == "active" {
-        all.sort_by(|a, b| {
-            let ak = a.last_joined_at.unwrap_or(a.created_at);
-            let bk = b.last_joined_at.unwrap_or(b.created_at);
-            bk.cmp(&ak)
-        });
+        qb.push("COALESCE(MAX(cp.created_at), c.created_at) DESC");
     } else {
-        all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        qb.push("c.created_at DESC");
+    }
+    qb.push(" LIMIT 30");
+
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        i32,
+        i32,
+        NaiveDateTime,
+        i64,
+        Option<NaiveDateTime>,
+    )> = qb.build_query_as().fetch_all(&state.pool).await?;
+    let campaign_ids: Vec<String> = rows.iter().map(|row| row.0.clone()).collect();
+    let tags_by_campaign = fetch_tags_by_campaign(&state.pool, &campaign_ids).await?;
+    let participants_by_campaign =
+        fetch_participants_by_campaign(&state.pool, &campaign_ids).await?;
+
+    let all = rows
+        .into_iter()
+        .map(
+            |(
+                id,
+                name,
+                description,
+                price,
+                goal_count,
+                created_at,
+                current_count,
+                last_joined_at,
+            )| {
+                let tags = tags_by_campaign.get(&id).cloned().unwrap_or_default();
+                let participants = participants_by_campaign
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default();
+                CampaignRes {
+                    id,
+                    name,
+                    description,
+                    price,
+                    goal_count,
+                    current_count: current_count as i32,
+                    tags,
+                    status: "open".to_string(),
+                    created_at,
+                    last_joined_at,
+                    participants,
+                }
+            },
+        )
+        .collect();
+
+    Ok(Json(all))
+}
+
+async fn fetch_tags_by_campaign(
+    pool: &MySqlPool,
+    campaign_ids: &[String],
+) -> Result<HashMap<String, Vec<String>>, AppError> {
+    let mut tags_by_campaign: HashMap<String, Vec<String>> = HashMap::new();
+    if campaign_ids.is_empty() {
+        return Ok(tags_by_campaign);
     }
 
-    all.truncate(30);
-    Ok(Json(all))
+    let mut qb = QueryBuilder::<MySql>::new(
+        "SELECT ct.campaign_id, t.name \
+         FROM campaign_tags ct \
+         JOIN tags t ON ct.tag_id = t.id \
+         WHERE ct.campaign_id IN (",
+    );
+    let mut separated = qb.separated(", ");
+    for campaign_id in campaign_ids {
+        separated.push_bind(campaign_id);
+    }
+    drop(separated);
+    qb.push(")");
+
+    let rows: Vec<(String, String)> = qb.build_query_as().fetch_all(pool).await?;
+    for (campaign_id, tag_name) in rows {
+        tags_by_campaign
+            .entry(campaign_id)
+            .or_default()
+            .push(tag_name);
+    }
+    Ok(tags_by_campaign)
+}
+
+async fn fetch_participants_by_campaign(
+    pool: &MySqlPool,
+    campaign_ids: &[String],
+) -> Result<HashMap<String, Vec<ParticipantRes>>, AppError> {
+    let mut participants_by_campaign: HashMap<String, Vec<ParticipantRes>> = HashMap::new();
+    if campaign_ids.is_empty() {
+        return Ok(participants_by_campaign);
+    }
+
+    let mut qb = QueryBuilder::<MySql>::new(
+        "SELECT cp.campaign_id, cp.user_id, u.name, cp.created_at \
+         FROM campaign_participants cp \
+         JOIN users u ON cp.user_id = u.id \
+         WHERE cp.campaign_id IN (",
+    );
+    let mut separated = qb.separated(", ");
+    for campaign_id in campaign_ids {
+        separated.push_bind(campaign_id);
+    }
+    drop(separated);
+    qb.push(") ORDER BY cp.campaign_id, cp.created_at ASC");
+
+    let rows: Vec<(String, String, String, NaiveDateTime)> =
+        qb.build_query_as().fetch_all(pool).await?;
+    for (campaign_id, user_id, name, joined_at) in rows {
+        participants_by_campaign
+            .entry(campaign_id)
+            .or_default()
+            .push(ParticipantRes {
+                user_id,
+                name,
+                joined_at,
+            });
+    }
+    Ok(participants_by_campaign)
 }
 
 #[derive(Deserialize)]
@@ -617,11 +712,10 @@ async fn get_campaign_image(
     Extension(_user): Extension<AuthUser>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, AppError> {
-    let row: Option<(Vec<u8>,)> =
-        sqlx::query_as("SELECT image FROM campaigns WHERE id = ?")
-            .bind(&id)
-            .fetch_optional(&state.pool)
-            .await?;
+    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT image FROM campaigns WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.pool)
+        .await?;
     let bytes = match row {
         Some((b,)) => b,
         None => return Err(AppError::NotFound),
@@ -661,12 +755,11 @@ async fn join_campaign(
 ) -> Result<Json<CampaignRes>, AppError> {
     let mut tx = state.pool.begin().await?;
 
-    let (credit_limit,): (i32,) = sqlx::query_as(
-        "SELECT credit_limit FROM users WHERE id = ? FOR UPDATE",
-    )
-    .bind(user_id.to_string())
-    .fetch_one(&mut *tx)
-    .await?;
+    let (credit_limit,): (i32,) =
+        sqlx::query_as("SELECT credit_limit FROM users WHERE id = ? FOR UPDATE")
+            .bind(user_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
 
     let row = sqlx::query("SELECT goal_count, price FROM campaigns WHERE id = ? FOR UPDATE")
         .bind(&campaign_id)
@@ -699,30 +792,20 @@ async fn join_campaign(
         return Err(AppError::Conflict);
     }
 
-    let part_rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT campaign_id FROM campaign_participants WHERE user_id = ?",
+    let (before_credit_used,): (i64,) = sqlx::query_as(
+        "SELECT CAST(COALESCE(SUM(c.price), 0) AS SIGNED) \
+         FROM campaign_participants cp \
+         JOIN campaigns c ON c.id = cp.campaign_id \
+         JOIN ( \
+             SELECT campaign_id, COUNT(*) AS current_count \
+             FROM campaign_participants \
+             GROUP BY campaign_id \
+         ) cc ON cc.campaign_id = c.id \
+         WHERE cp.user_id = ? AND cc.current_count < c.goal_count",
     )
     .bind(user_id.to_string())
-    .fetch_all(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
-    let mut before_credit_used: i64 = 0;
-    for (cid,) in part_rows {
-        let row = sqlx::query("SELECT price, goal_count FROM campaigns WHERE id = ?")
-            .bind(&cid)
-            .fetch_one(&mut *tx)
-            .await?;
-        let p: i32 = row.try_get("price")?;
-        let g: i32 = row.try_get("goal_count")?;
-        let (count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM campaign_participants WHERE campaign_id = ?",
-        )
-        .bind(&cid)
-        .fetch_one(&mut *tx)
-        .await?;
-        if (count as i32) < g {
-            before_credit_used += p as i64;
-        }
-    }
     if before_credit_used as i32 + price > credit_limit {
         return Err(AppError::PaymentRequired);
     }
@@ -935,7 +1018,6 @@ async fn list_charges(
     Ok(Json(res))
 }
 
-
 async fn hydrate_campaign(
     conn: &mut sqlx::MySqlConnection,
     id: &str,
@@ -1014,4 +1096,3 @@ async fn hydrate_campaign_via_pool(
     let mut conn = pool.acquire().await?;
     hydrate_campaign(&mut conn, id).await
 }
-

@@ -38,7 +38,9 @@ CREATE TABLE `campaigns` (
     `goal_count` INT NOT NULL,
     `image` LONGBLOB NOT NULL,
     `created_at` DATETIME(6) NOT NULL,
-    PRIMARY KEY (`id`)
+    PRIMARY KEY (`id`),
+    KEY `idx_campaigns_created` (`created_at`),
+    KEY `idx_campaigns_created_id` (`created_at`, `id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE `campaign_participants` (
@@ -46,14 +48,19 @@ CREATE TABLE `campaign_participants` (
     `campaign_id` CHAR(36) NOT NULL,
     `user_id` CHAR(36) NOT NULL,
     `created_at` DATETIME(6) NOT NULL,
-    PRIMARY KEY (`id`)
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uniq_campaign_user` (`campaign_id`, `user_id`),
+    KEY `idx_cp_user_campaign` (`user_id`, `campaign_id`),
+    KEY `idx_cp_campaign_created` (`campaign_id`, `created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE `charges` (
     `id` CHAR(36) NOT NULL,
     `campaign_participant_id` CHAR(36) NOT NULL,
     `created_at` DATETIME(6) NOT NULL,
-    PRIMARY KEY (`id`)
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uniq_charges_participant` (`campaign_participant_id`),
+    KEY `idx_charges_created` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE `tags` (
@@ -68,21 +75,24 @@ CREATE TABLE `campaign_tags` (
     `campaign_id` CHAR(36) NOT NULL,
     `tag_id` CHAR(36) NOT NULL,
     `created_at` DATETIME(6) NOT NULL,
-    PRIMARY KEY (`campaign_id`, `tag_id`)
+    PRIMARY KEY (`campaign_id`, `tag_id`),
+    KEY `idx_ct_tag_campaign` (`tag_id`, `campaign_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE `saved_searches` (
     `id` CHAR(36) NOT NULL,
     `user_id` CHAR(36) NOT NULL,
     `created_at` DATETIME(6) NOT NULL,
-    PRIMARY KEY (`id`)
+    PRIMARY KEY (`id`),
+    KEY `idx_ss_user` (`user_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE `saved_search_tags` (
     `saved_search_id` CHAR(36) NOT NULL,
     `tag_id` CHAR(36) NOT NULL,
     `created_at` DATETIME(6) NOT NULL,
-    PRIMARY KEY (`saved_search_id`, `tag_id`)
+    PRIMARY KEY (`saved_search_id`, `tag_id`),
+    KEY `idx_sst_tag_saved_search` (`tag_id`, `saved_search_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE `app_config` (
