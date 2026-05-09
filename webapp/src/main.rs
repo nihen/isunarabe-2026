@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -29,8 +29,8 @@ struct AppState {
     pool: MySqlPool,
     sql_dir: PathBuf,
     db: Arc<DbConn>,
-    http: reqwest::Client,
     cache: Arc<AppCache>,
+    webhook_tx: mpsc::Sender<WebhookMessage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +44,12 @@ struct DbConn {
 
 #[derive(Clone, Copy)]
 struct AuthUser(Uuid);
+
+#[derive(Clone)]
+struct WebhookMessage {
+    url: String,
+    body: serde_json::Value,
+}
 
 #[derive(Default)]
 struct AppCache {
@@ -106,13 +112,15 @@ async fn main() {
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sql"));
 
     let http = reqwest::Client::new();
+    let (webhook_tx, webhook_rx) = mpsc::channel(8192);
+    tokio::spawn(webhook_worker(http.clone(), webhook_rx));
 
     let state = AppState {
         pool,
         sql_dir,
         db: Arc::new(db),
-        http,
         cache: Arc::new(AppCache::default()),
+        webhook_tx,
     };
 
     let unauthed_api = Router::new()
@@ -176,6 +184,14 @@ fn parse_db_url(dsn: &str) -> DbConn {
         user: u.username().to_string(),
         password: u.password().unwrap_or("").to_string(),
         database: u.path().trim_start_matches('/').to_string(),
+    }
+}
+
+async fn webhook_worker(http: reqwest::Client, mut rx: mpsc::Receiver<WebhookMessage>) {
+    while let Some(message) = rx.recv().await {
+        if let Err(e) = http.post(&message.url).json(&message.body).send().await {
+            eprintln!("webhook send to {}: {e}", message.url);
+        }
     }
 }
 
@@ -1163,8 +1179,12 @@ async fn join_campaign(
                     "last_joined_at": response_campaign.last_joined_at.map(fmt_dt),
                 }
             });
-            if let Err(e) = state.http.post(&webhook_url).json(&body).send().await {
-                eprintln!("webhook send to {webhook_url} for user {uid}: {e}");
+            let message = WebhookMessage {
+                url: webhook_url.clone(),
+                body,
+            };
+            if let Err(e) = state.webhook_tx.try_send(message) {
+                eprintln!("webhook queue full for user {uid}: {e}");
             }
         }
     }
