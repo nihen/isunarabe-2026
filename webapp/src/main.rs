@@ -8,12 +8,11 @@ use axum::{
     Extension, Json, Router,
 };
 use bytes::Bytes;
-use chrono::{NaiveDateTime, Utc};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use chrono::{Datelike, NaiveDateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::Digest as _;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
-use sqlx::Row;
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -59,8 +58,7 @@ const DEFAULT_CREDIT_LIMIT: i32 = 60000;
 
 // ── AppState ──
 
-#[derive(Clone)]
-struct AppState {
+struct AppStateInner {
     pool: MySqlPool,
     sql_dir: PathBuf,
     image_dir: PathBuf,
@@ -71,6 +69,14 @@ struct AppState {
     db_tx: mpsc::Sender<DbWrite>,
     replica_urls: Arc<Vec<String>>,
     http: reqwest::Client,
+}
+
+#[derive(Clone)]
+struct AppState(Arc<AppStateInner>);
+
+impl std::ops::Deref for AppState {
+    type Target = AppStateInner;
+    fn deref(&self) -> &Self::Target { &self.0 }
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +101,7 @@ struct WebhookMessage {
 
 struct Store {
     data: parking_lot::RwLock<StoreData>,
+    user_ids: parking_lot::RwLock<HashSet<String>>,
     // Async-safe for image I/O
     campaign_image: tokio::sync::RwLock<HashMap<String, ImageCache>>,
     // Pre-computed list responses (rebuilt on join/create, not on every list request)
@@ -108,10 +115,12 @@ struct StoreData {
     users: HashMap<String, MemUser>,
     campaigns: HashMap<String, MemCampaign>,
     tags: Vec<String>,
+    tags_cache: Bytes,
     tag_id_by_name: HashMap<String, String>,
     tag_name_by_id: HashMap<String, String>,
     saved_searches: HashMap<String, Vec<MemSavedSearch>>,
     charges: HashMap<String, Vec<ChargeEntry>>,
+    charges_cache: HashMap<String, Bytes>,
     webhook_url: String,
     me_cache: HashMap<String, Bytes>,
 }
@@ -157,7 +166,7 @@ impl MemCampaign {
             status: if cc >= self.goal_count { "closed" } else { "open" }.to_string(),
             created_at: self.created_at,
             last_joined_at: self.last_joined_at,
-            participants: self.participants.iter().map(|p| p.as_ref().clone()).collect(),
+            participants: self.participants.clone(),
         }
     }
 }
@@ -219,7 +228,7 @@ struct ChargeEntry {
 
 #[derive(Clone)]
 struct ImageCache {
-    path: PathBuf,
+    data: Bytes,
     etag: String,
 }
 
@@ -230,13 +239,16 @@ impl Store {
                 users: HashMap::new(),
                 campaigns: HashMap::new(),
                 tags: Vec::new(),
+                tags_cache: Bytes::new(),
                 tag_id_by_name: HashMap::new(),
                 tag_name_by_id: HashMap::new(),
                 saved_searches: HashMap::new(),
                 charges: HashMap::new(),
+                charges_cache: HashMap::new(),
                 webhook_url: String::new(),
                 me_cache: HashMap::new(),
             }),
+            user_ids: parking_lot::RwLock::new(HashSet::new()),
             campaign_image: tokio::sync::RwLock::new(HashMap::new()),
             list_cache_dirty: parking_lot::RwLock::new(true),
             list_cache: parking_lot::RwLock::new(HashMap::new()),
@@ -377,12 +389,30 @@ impl Store {
         .fetch_optional(pool).await?;
         let webhook_url = url_row.map(|(v,)| v).unwrap_or_default();
 
+        // Pre-serialize tags (immutable after init)
+        let tags_cache = Bytes::from(serde_json::to_vec(&tags).unwrap_or_default());
+
+        // Pre-serialize charges per user
+        let mut charges_cache = HashMap::with_capacity(charges.len());
+        for (uid, entries) in &charges {
+            let res: Vec<ChargeRes> = entries.iter().map(|c| ChargeRes {
+                id: c.id.clone(), amount: c.amount,
+                campaign: ChargeCampaign { id: c.campaign_id.clone(), name: c.campaign_name.clone(), price: c.campaign_price },
+                created_at: c.created_at,
+            }).collect();
+            charges_cache.insert(uid.clone(), Bytes::from(serde_json::to_vec(&res).unwrap_or_default()));
+        }
+
+        // Populate user_ids set (separate lock for auth fast-path)
+        let user_id_set: HashSet<String> = users.keys().cloned().collect();
+
         // Replace all data at once (single write lock)
         *self.data.write() = StoreData {
-            users, campaigns, tags, tag_id_by_name, tag_name_by_id,
-            saved_searches, charges, webhook_url,
+            users, campaigns, tags, tags_cache, tag_id_by_name, tag_name_by_id,
+            saved_searches, charges, charges_cache, webhook_url,
             me_cache: HashMap::new(),
         };
+        *self.user_ids.write() = user_id_set;
 
         // Clear image cache (will warm lazily)
         self.campaign_image.write().await.clear();
@@ -512,7 +542,7 @@ async fn main() {
         eprintln!("startup load_from_db failed (expected on first boot): {e:?}");
     }
 
-    let state = AppState {
+    let state = AppState(Arc::new(AppStateInner {
         pool, sql_dir, image_dir, seed_image_dir,
         db: Arc::new(db),
         store,
@@ -520,7 +550,7 @@ async fn main() {
         db_tx,
         replica_urls: Arc::new(replica_urls),
         http,
-    };
+    }));
 
     let unauthed_api = Router::new()
         .route("/initialize", post(initialize))
@@ -684,6 +714,7 @@ where T: serde::de::DeserializeOwned, S: Send + Sync,
     }
 }
 
+#[inline]
 async fn auth_middleware(
     State(state): State<AppState>,
     mut req: Request,
@@ -693,7 +724,7 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .ok_or(AppError::Unauthorized)?
         .to_string();
-    if !state.store.data.read().users.contains_key(&user_id) {
+    if !state.store.user_ids.read().contains(&user_id) {
         return Err(AppError::Unauthorized);
     }
     req.extensions_mut().insert(AuthUser(user_id));
@@ -702,14 +733,61 @@ async fn auth_middleware(
 
 fn now_naive() -> NaiveDateTime { Utc::now().naive_utc() }
 
-fn fmt_dt(dt: NaiveDateTime) -> String { dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string() }
-
-fn serialize_dt<S: Serializer>(dt: &NaiveDateTime, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&fmt_dt(*dt))
+#[inline(always)]
+fn write_dt_buf(dt: NaiveDateTime, buf: &mut [u8; 24]) {
+    let (y, mo, d) = (dt.year() as u32, dt.month(), dt.day());
+    let (h, mi, sec) = (dt.hour(), dt.minute(), dt.second());
+    let ms = dt.nanosecond() / 1_000_000;
+    buf[0] = b'0' + (y / 1000) as u8;
+    buf[1] = b'0' + ((y / 100) % 10) as u8;
+    buf[2] = b'0' + ((y / 10) % 10) as u8;
+    buf[3] = b'0' + (y % 10) as u8;
+    buf[4] = b'-';
+    buf[5] = b'0' + (mo / 10) as u8;
+    buf[6] = b'0' + (mo % 10) as u8;
+    buf[7] = b'-';
+    buf[8] = b'0' + (d / 10) as u8;
+    buf[9] = b'0' + (d % 10) as u8;
+    buf[10] = b'T';
+    buf[11] = b'0' + (h / 10) as u8;
+    buf[12] = b'0' + (h % 10) as u8;
+    buf[13] = b':';
+    buf[14] = b'0' + (mi / 10) as u8;
+    buf[15] = b'0' + (mi % 10) as u8;
+    buf[16] = b':';
+    buf[17] = b'0' + (sec / 10) as u8;
+    buf[18] = b'0' + (sec % 10) as u8;
+    buf[19] = b'.';
+    buf[20] = b'0' + (ms / 100) as u8;
+    buf[21] = b'0' + ((ms / 10) % 10) as u8;
+    buf[22] = b'0' + (ms % 10) as u8;
+    buf[23] = b'Z';
 }
 
+#[inline]
+fn fmt_dt(dt: NaiveDateTime) -> String {
+    let mut buf = [0u8; 24];
+    write_dt_buf(dt, &mut buf);
+    unsafe { String::from_utf8_unchecked(buf.to_vec()) }
+}
+
+#[inline]
+fn serialize_dt<S: Serializer>(dt: &NaiveDateTime, s: S) -> Result<S::Ok, S::Error> {
+    let mut buf = [0u8; 24];
+    write_dt_buf(*dt, &mut buf);
+    s.serialize_str(unsafe { std::str::from_utf8_unchecked(&buf) })
+}
+
+#[inline]
 fn serialize_dt_opt<S: Serializer>(dt: &Option<NaiveDateTime>, s: S) -> Result<S::Ok, S::Error> {
-    match dt { Some(dt) => s.serialize_str(&fmt_dt(*dt)), None => s.serialize_none() }
+    match dt {
+        Some(dt) => {
+            let mut buf = [0u8; 24];
+            write_dt_buf(*dt, &mut buf);
+            s.serialize_str(unsafe { std::str::from_utf8_unchecked(&buf) })
+        }
+        None => s.serialize_none(),
+    }
 }
 
 fn validate_price(price: i32) -> Result<(), AppError> {
@@ -739,7 +817,7 @@ struct CampaignRes {
     created_at: NaiveDateTime,
     #[serde(serialize_with = "serialize_dt_opt")]
     last_joined_at: Option<NaiveDateTime>,
-    participants: Vec<ParticipantRes>,
+    participants: Vec<Arc<ParticipantRes>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -853,6 +931,7 @@ async fn create_user(
     state.store.data.write().users.insert(id.clone(), MemUser {
         name: req.name.clone(), credit_limit, open_credit_used: 0,
     });
+    state.store.user_ids.write().insert(id.clone());
 
     if !state.replica_urls.is_empty() {
         let event = SyncEvent::UserCreated { id: id.clone(), name: req.name.clone(), credit_limit };
@@ -891,9 +970,9 @@ async fn get_me(
 
 // ── Tags ──
 
-async fn list_tags(State(state): State<AppState>) -> Result<Json<Vec<String>>, AppError> {
-    let tags = state.store.data.read().tags.clone();
-    Ok(Json(tags))
+async fn list_tags(State(state): State<AppState>) -> Result<Response, AppError> {
+    let bytes = state.store.data.read().tags_cache.clone();
+    Ok(response_from_json_bytes(bytes))
 }
 
 // ── Campaigns ──
@@ -1019,7 +1098,7 @@ async fn image_cache_from_file(path: PathBuf) -> Result<Option<ImageCache>, AppE
         Err(e) => return Err(AppError::Internal(format!("read image: {e}"))),
     };
     let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(&bytes)));
-    Ok(Some(ImageCache { path, etag }))
+    Ok(Some(ImageCache { data: Bytes::from(bytes), etag }))
 }
 
 async fn write_campaign_image_file(state: &AppState, id: &str, bytes: &[u8]) -> Result<ImageCache, AppError> {
@@ -1029,7 +1108,7 @@ async fn write_campaign_image_file(state: &AppState, id: &str, bytes: &[u8]) -> 
     tokio::fs::write(&path, bytes).await
         .map_err(|e| AppError::Internal(format!("write image: {e}")))?;
     let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(bytes)));
-    Ok(ImageCache { path, etag })
+    Ok(ImageCache { data: Bytes::from(bytes.to_vec()), etag })
 }
 
 async fn image_response(image: ImageCache, headers: &HeaderMap) -> Result<Response, AppError> {
@@ -1039,12 +1118,10 @@ async fn image_response(image: ImageCache, headers: &HeaderMap) -> Result<Respon
     if not_modified {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, image.etag)]).into_response());
     }
-    let bytes = tokio::fs::read(&image.path).await
-        .map_err(|e| AppError::Internal(format!("read image: {e}")))?;
     Ok((StatusCode::OK, [
         (header::CONTENT_TYPE, "image/jpeg".to_string()),
         (header::ETAG, image.etag),
-    ], Body::from(bytes)).into_response())
+    ], Body::from(image.data)).into_response())
 }
 
 // ── Create campaign ──
@@ -1193,6 +1270,7 @@ async fn join_campaign(
                     campaign_price: price, created_at: now,
                 };
                 d.charges.entry(uid.clone()).or_default().insert(0, charge);
+                d.charges_cache.remove(uid);
             }
         }
 
@@ -1344,17 +1422,32 @@ async fn create_saved_search(
 async fn list_charges(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
-) -> Result<Json<Vec<ChargeRes>>, AppError> {
-    let user_id_s = user_id;
-    let d = state.store.data.read();
-    let user_charges = d.charges.get(&user_id_s).cloned().unwrap_or_default();
+) -> Result<Response, AppError> {
+    {
+        let d = state.store.data.read();
+        if let Some(cached) = d.charges_cache.get(&user_id) {
+            return Ok(response_from_json_bytes(cached.clone()));
+        }
+        if !d.charges.contains_key(&user_id) {
+            return Ok(response_from_json_bytes(Bytes::from_static(b"[]")));
+        }
+    }
+    let mut d = state.store.data.write();
+    let entries = d.charges.get(&user_id);
+    let bytes = match entries {
+        Some(entries) => {
+            let res: Vec<ChargeRes> = entries.iter().map(|c| ChargeRes {
+                id: c.id.clone(), amount: c.amount,
+                campaign: ChargeCampaign { id: c.campaign_id.clone(), name: c.campaign_name.clone(), price: c.campaign_price },
+                created_at: c.created_at,
+            }).collect();
+            Bytes::from(serde_json::to_vec(&res).unwrap_or_default())
+        }
+        None => Bytes::from_static(b"[]"),
+    };
+    d.charges_cache.insert(user_id, bytes.clone());
     drop(d);
-    let res: Vec<ChargeRes> = user_charges.into_iter().map(|c| ChargeRes {
-        id: c.id, amount: c.amount,
-        campaign: ChargeCampaign { id: c.campaign_id, name: c.campaign_name, price: c.campaign_price },
-        created_at: c.created_at,
-    }).collect();
-    Ok(Json(res))
+    Ok(response_from_json_bytes(bytes))
 }
 
 // ── Internal sync ──
@@ -1375,9 +1468,10 @@ async fn apply_sync_event(state: &AppState, event: SyncEvent) -> Result<(), AppE
             state.store.load_from_db(&state.pool).await?;
         }
         SyncEvent::UserCreated { id, name, credit_limit } => {
-            state.store.data.write().users.insert(id, MemUser {
+            state.store.data.write().users.insert(id.clone(), MemUser {
                 name, credit_limit, open_credit_used: 0,
             });
+            state.store.user_ids.write().insert(id);
         }
         SyncEvent::CampaignCreated { id, name, description, price, goal_count, created_at, tags, tag_ids } => {
             let camp = MemCampaign {
@@ -1433,6 +1527,7 @@ async fn apply_sync_event(state: &AppState, event: SyncEvent) -> Result<(), AppE
 
                 // Phase 3: Add charges
                 for sc in new_charges {
+                    d.charges_cache.remove(&sc.user_id);
                     d.charges.entry(sc.user_id).or_default().insert(0, ChargeEntry {
                         id: sc.charge_id, amount: sc.campaign_price,
                         campaign_id: sc.campaign_id, campaign_name: sc.campaign_name,
