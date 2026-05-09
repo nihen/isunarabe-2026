@@ -755,7 +755,7 @@ async fn create_user(
 
     let event = SyncEvent::UserCreated { id: id.clone(), name: req.name.clone(), credit_limit };
     let st = state.clone();
-    tokio::spawn(async move { broadcast_sync(&st, &event).await; });
+    broadcast_sync(&state, &event).await;
 
     Ok(Json(UserRes { id, name: req.name, credit_limit }))
 }
@@ -1012,7 +1012,7 @@ async fn create_campaign(
         created_at: camp_clone.created_at, tags: camp_clone.tags, tag_ids: camp_clone.tag_ids,
     };
     let st = state.clone();
-    tokio::spawn(async move { broadcast_sync(&st, &event).await; });
+    broadcast_sync(&state, &event).await;
 
     let image = write_campaign_image_file(&state, &id, &image_bytes).await?;
     state.store.campaign_image.write().await.insert(id, image);
@@ -1136,8 +1136,7 @@ async fn join_campaign(
             joined_at: now, price, closed,
             close_participant_ids: close_ids, new_charges,
         };
-        let state2 = state.clone();
-        tokio::spawn(async move { broadcast_sync(&state2, &event).await; });
+        broadcast_sync(&state, &event).await;
     }
 
     // Synchronous DB write (for persistence / 追試). Lock already released.
@@ -1240,7 +1239,7 @@ async fn create_saved_search(
         user_id: user_id_s, tag_ids: tag_id_vec.into_iter().collect(),
     };
     let st = state.clone();
-    tokio::spawn(async move { broadcast_sync(&st, &event).await; });
+    broadcast_sync(&state, &event).await;
 
     Ok(StatusCode::CREATED)
 }
