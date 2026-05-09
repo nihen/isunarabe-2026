@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
+use bytes::Bytes;
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::Digest as _;
@@ -25,7 +26,7 @@ enum DbWrite {
         campaign_id: String,
         user_id: String,
         created_at: NaiveDateTime,
-        close_participant_ids: Option<Vec<String>>,
+        close: bool,
     },
     CreateCampaign {
         id: String,
@@ -97,9 +98,9 @@ struct Store {
     campaign_image: tokio::sync::RwLock<HashMap<String, ImageCache>>,
     // Pre-computed list responses (rebuilt on join/create, not on every list request)
     list_cache_dirty: parking_lot::RwLock<bool>,
-    list_cache: parking_lot::RwLock<HashMap<String, Arc<Vec<u8>>>>,
+    list_cache: parking_lot::RwLock<HashMap<String, Bytes>>,
     // Pre-serialized campaign responses
-    campaign_json_cache: parking_lot::RwLock<HashMap<String, Arc<Vec<u8>>>>,
+    campaign_json_cache: parking_lot::RwLock<HashMap<String, Bytes>>,
 }
 
 struct StoreData {
@@ -111,6 +112,7 @@ struct StoreData {
     saved_searches: HashMap<String, Vec<MemSavedSearch>>,
     charges: HashMap<String, Vec<ChargeEntry>>,
     webhook_url: String,
+    me_cache: HashMap<String, Bytes>,
 }
 
 #[derive(Clone)]
@@ -232,6 +234,7 @@ impl Store {
                 saved_searches: HashMap::new(),
                 charges: HashMap::new(),
                 webhook_url: String::new(),
+                me_cache: HashMap::new(),
             }),
             campaign_image: tokio::sync::RwLock::new(HashMap::new()),
             list_cache_dirty: parking_lot::RwLock::new(true),
@@ -377,6 +380,7 @@ impl Store {
         *self.data.write() = StoreData {
             users, campaigns, tags, tag_id_by_name, tag_name_by_id,
             saved_searches, charges, webhook_url,
+            me_cache: HashMap::new(),
         };
 
         // Clear image cache (will warm lazily)
@@ -448,8 +452,8 @@ impl Store {
 
             let new_bytes = serde_json::to_vec(&by_new).unwrap_or_default();
             let active_bytes = serde_json::to_vec(&by_active).unwrap_or_default();
-            cache.insert(format!("sort=new;tags={tag_key}"), Arc::new(new_bytes));
-            cache.insert(format!("sort=active;tags={tag_key}"), Arc::new(active_bytes));
+            cache.insert(format!("sort=new;tags={tag_key}"), Bytes::from(new_bytes));
+            cache.insert(format!("sort=active;tags={tag_key}"), Bytes::from(active_bytes));
         }
 
         drop(d);
@@ -459,9 +463,9 @@ impl Store {
     }
 
     fn invalidate_campaign(&self, campaign_id: &str, camp: &MemCampaign) {
-        let bytes = serde_json::to_vec(&camp.to_response(campaign_id)).unwrap_or_default();
+        let bytes = Bytes::from(serde_json::to_vec(&camp.to_response(campaign_id)).unwrap_or_default());
         self.campaign_json_cache.write()
-            .insert(campaign_id.to_string(), Arc::new(bytes));
+            .insert(campaign_id.to_string(), bytes);
         self.list_cache.write().clear();
     }
 }
@@ -586,13 +590,16 @@ async fn db_write_worker(pool: MySqlPool, mut rx: mpsc::Receiver<DbWrite>) {
     while let Some(write) = rx.recv().await {
         let r: Result<(), sqlx::Error> = async {
             match write {
-                DbWrite::Join { participant_id, campaign_id, user_id, created_at, close_participant_ids } => {
+                DbWrite::Join { participant_id, campaign_id, user_id, created_at, close } => {
                     let mut tx = pool.begin().await?;
                     sqlx::query("INSERT INTO campaign_participants (id, campaign_id, user_id, created_at) VALUES (?, ?, ?, ?)")
                         .bind(&participant_id).bind(&campaign_id).bind(&user_id).bind(created_at)
                         .execute(&mut *tx).await?;
-                    if let Some(pids) = close_participant_ids {
-                        for pid in pids {
+                    if close {
+                        let parts: Vec<(String,)> = sqlx::query_as(
+                            "SELECT id FROM campaign_participants WHERE campaign_id = ?",
+                        ).bind(&campaign_id).fetch_all(&mut *tx).await?;
+                        for (pid,) in parts {
                             sqlx::query("INSERT INTO charges (id, campaign_participant_id, created_at) VALUES (?, ?, ?)")
                                 .bind(Uuid::new_v4().to_string()).bind(pid).bind(created_at)
                                 .execute(&mut *tx).await?;
@@ -855,18 +862,28 @@ async fn create_user(
 async fn get_me(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
-) -> Result<Json<MeRes>, AppError> {
+) -> Result<Response, AppError> {
     let user_id_s = user_id;
+    // Check me_cache first
+    {
+        let d = state.store.data.read();
+        if let Some(cached) = d.me_cache.get(&user_id_s) {
+            return Ok(response_from_json_bytes(cached.clone()));
+        }
+    }
+    // Cache miss: build and store
     let d = state.store.data.read();
     let user = d.users.get(&user_id_s).ok_or(AppError::Unauthorized)?;
     let result = MeRes {
-        id: user_id_s,
+        id: user_id_s.clone(),
         name: user.name.clone(),
         credit_limit: user.credit_limit,
         credit_used: user.open_credit_used,
     };
     drop(d);
-    Ok(Json(result))
+    let bytes = Bytes::from(serde_json::to_vec(&result).map_err(|e| AppError::Internal(format!("json: {e}")))?);
+    state.store.data.write().me_cache.insert(user_id_s, bytes.clone());
+    Ok(response_from_json_bytes(bytes))
 }
 
 // ── Tags ──
@@ -881,9 +898,9 @@ async fn list_tags(State(state): State<AppState>) -> Result<Json<Vec<String>>, A
 #[derive(Deserialize)]
 struct ListCampaignsQuery { tags: Option<String>, sort: Option<String> }
 
-fn response_from_json_bytes(body: Arc<Vec<u8>>) -> Response {
+fn response_from_json_bytes(body: Bytes) -> Response {
     (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")],
-     Body::from(body.as_ref().clone())).into_response()
+     Body::from(body)).into_response()
 }
 
 async fn list_campaigns(
@@ -942,7 +959,7 @@ async fn list_campaigns(
         open.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     }
     open.truncate(30);
-    let bytes = Arc::new(serde_json::to_vec(&open).unwrap_or_default());
+    let bytes = Bytes::from(serde_json::to_vec(&open).unwrap_or_default());
     state.store.list_cache.write().insert(cache_key, bytes.clone());
     Ok(response_from_json_bytes(bytes))
 }
@@ -960,8 +977,7 @@ async fn get_campaign(
     let camp = d.campaigns.get(&id).ok_or(AppError::NotFound)?;
     let res = camp.to_response(&id);
     drop(d);
-    let bytes = serde_json::to_vec(&res).map_err(|e| AppError::Internal(format!("json: {e}")))?;
-    let body = Arc::new(bytes);
+    let body = Bytes::from(serde_json::to_vec(&res).map_err(|e| AppError::Internal(format!("json: {e}")))?);
     state.store.campaign_json_cache.write().insert(id, body.clone());
     Ok(response_from_json_bytes(body))
 }
@@ -1153,6 +1169,7 @@ async fn join_campaign(
         let after = camp.current_count();
 
         d.users.get_mut(&user_id_s).unwrap().open_credit_used += price;
+        d.me_cache.remove(&user_id_s);
 
         // Campaign close (mutations)
         if after == goal_count {
@@ -1164,6 +1181,7 @@ async fn join_campaign(
                 if let Some(u) = d.users.get_mut(uid) {
                     u.open_credit_used -= price;
                 }
+                d.me_cache.remove(uid);
                 let charge = ChargeEntry {
                     id: Uuid::new_v4().to_string(), amount: price,
                     campaign_id: campaign_id.clone(), campaign_name: camp_name.clone(),
@@ -1194,7 +1212,7 @@ async fn join_campaign(
 
         let camp = d.campaigns.get(&campaign_id).unwrap();
         let response = camp.to_response(&campaign_id);
-        let response_bytes = Arc::new(serde_json::to_vec(&response)
+        let response_bytes = Bytes::from(serde_json::to_vec(&response)
             .map_err(|e| AppError::Internal(format!("json: {e}")))?);
         let webhook_url = d.webhook_url.clone();
         let new_charges_sync = Vec::<SyncCharge>::new();
@@ -1227,17 +1245,11 @@ async fn join_campaign(
     }
 
     // Async DB write-behind via dedicated worker (no DB wait in response path)
-    let close_pids = if after == goal_count {
-        let d = state.store.data.read();
-        let camp = d.campaigns.get(&campaign_id);
-        camp.map(|c| c.participant_user_ids.iter().cloned().collect::<Vec<_>>())
-    } else { None };
-    // participant_id needs to be stored in memory too for DB charges
     let participant_id = Uuid::new_v4().to_string();
     let _ = state.db_tx.try_send(DbWrite::Join {
         participant_id, campaign_id: campaign_id.clone(),
         user_id: user_id_s.clone(), created_at: now,
-        close_participant_ids: close_pids,
+        close: after == goal_count,
     });
 
     // Webhooks
@@ -1396,12 +1408,14 @@ async fn apply_sync_event(state: &AppState, event: SyncEvent) -> Result<(), AppE
                     if let Some(u) = d.users.get_mut(&user_id) {
                         u.open_credit_used += price;
                     }
+                    d.me_cache.remove(&user_id);
                 }
                 if closed {
                     for uid in &close_participant_ids {
                         if let Some(u) = d.users.get_mut(uid) {
                             u.open_credit_used -= price;
                         }
+                        d.me_cache.remove(uid);
                     }
                 }
 
