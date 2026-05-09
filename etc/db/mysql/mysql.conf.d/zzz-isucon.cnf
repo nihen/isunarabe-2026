@@ -1,5 +1,16 @@
-# Deployed to /etc/mysql/mysql.conf.d/isucon.cnf on the DB server (nrb2026-3).
-# Restart mysql.service after changes.
+# Deployed to /etc/mysql/mysql.conf.d/zzz-isucon.cnf on the DB server (nrb2026-3).
 [mysqld]
 bind-address = 0.0.0.0
 max_connections = 1000
+
+# Write performance (durability trade-off acceptable for ISUCON)
+innodb_flush_log_at_trx_commit = 0
+sync_binlog = 0
+
+# Memory
+innodb_buffer_pool_size = 2G
+
+# I/O
+innodb_io_capacity = 2000
+innodb_io_capacity_max = 4000
+innodb_flush_method = O_DIRECT

@@ -301,7 +301,7 @@ async fn main() {
         .unwrap_or_else(|_| "mysql://isucon:isucon@127.0.0.1:3306/nrb2026".to_string());
     let db = parse_db_url(&dsn);
     let pool = MySqlPoolOptions::new()
-        .max_connections(16)
+        .max_connections(128)
         .connect(&dsn)
         .await
         .expect("connect to MySQL");
