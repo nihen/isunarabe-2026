@@ -34,6 +34,8 @@ struct AppState {
     db: Arc<DbConn>,
     store: Arc<Store>,
     webhook_tx: mpsc::Sender<WebhookMessage>,
+    replica_urls: Arc<Vec<String>>,
+    http: reqwest::Client,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +118,46 @@ impl MemCampaign {
             participants: self.participants.clone(),
         }
     }
+}
+
+// ── Sync events for replica ──
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum SyncEvent {
+    Reload,
+    UserCreated { id: String, name: String, credit_limit: i32 },
+    CampaignJoined {
+        campaign_id: String,
+        user_id: String,
+        user_name: String,
+        joined_at: NaiveDateTime,
+        price: i32,
+        closed: bool,
+        close_participant_ids: Vec<String>,
+        new_charges: Vec<SyncCharge>,
+    },
+    CampaignCreated {
+        id: String,
+        name: String,
+        description: String,
+        price: i32,
+        goal_count: i32,
+        created_at: NaiveDateTime,
+        tags: Vec<String>,
+        tag_ids: Vec<String>,
+    },
+    SavedSearchCreated { user_id: String, tag_ids: Vec<String> },
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct SyncCharge {
+    user_id: String,
+    charge_id: String,
+    campaign_id: String,
+    campaign_name: String,
+    campaign_price: i32,
+    created_at: NaiveDateTime,
 }
 
 #[derive(Clone)]
@@ -408,10 +450,16 @@ async fn main() {
 
     let (webhook_tx, webhook_rx) = mpsc::channel(8192);
     let http = reqwest::Client::new();
-    tokio::spawn(webhook_worker(http, webhook_rx));
+    tokio::spawn(webhook_worker(http.clone(), webhook_rx));
+
+    let replica_urls: Vec<String> = std::env::var("REPLICA_URLS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_string())
+        .collect();
 
     let store = Arc::new(Store::new());
-    // Auto-load from DB on startup (for restart recovery / 追試)
     if let Err(e) = store.load_from_db(&pool).await {
         eprintln!("startup load_from_db failed (expected on first boot): {e:?}");
     }
@@ -421,6 +469,8 @@ async fn main() {
         db: Arc::new(db),
         store,
         webhook_tx,
+        replica_urls: Arc::new(replica_urls),
+        http,
     };
 
     let unauthed_api = Router::new()
@@ -441,10 +491,14 @@ async fn main() {
     let api = unauthed_api.merge(authed_api)
         .fallback(|| async { StatusCode::NOT_FOUND });
 
+    let internal = Router::new()
+        .route("/sync", post(handle_sync));
+
     let static_dir: Option<PathBuf> = std::env::var_os("STATIC_DIR").map(PathBuf::from);
     let mut app = Router::<AppState>::new()
         .route("/healthz", get(healthz))
-        .nest("/api", api);
+        .nest("/api", api)
+        .nest("/internal", internal);
     if let Some(dir) = static_dir {
         let index = dir.join("index.html");
         if !index.is_file() {
@@ -637,6 +691,10 @@ async fn initialize(
     reset_image_dir(&state).await?;
     state.store.load_from_db(&state.pool).await?;
 
+    // Tell replicas to reload
+    let st = state.clone();
+    tokio::spawn(async move { broadcast_sync(&st, &SyncEvent::Reload).await; });
+
     Ok(Json(serde_json::json!({})))
 }
 
@@ -695,6 +753,10 @@ async fn create_user(
         name: req.name.clone(), credit_limit, open_credit_used: 0,
     });
     drop(_guard);
+
+    let event = SyncEvent::UserCreated { id: id.clone(), name: req.name.clone(), credit_limit };
+    let st = state.clone();
+    tokio::spawn(async move { broadcast_sync(&st, &event).await; });
 
     Ok(Json(UserRes { id, name: req.name, credit_limit }))
 }
@@ -945,6 +1007,14 @@ async fn create_campaign(
 
     state.store.invalidate_campaign(&id, &camp_clone).await;
 
+    let event = SyncEvent::CampaignCreated {
+        id: id.clone(), name: camp_clone.name, description: camp_clone.description,
+        price: camp_clone.price, goal_count: camp_clone.goal_count,
+        created_at: camp_clone.created_at, tags: camp_clone.tags, tag_ids: camp_clone.tag_ids,
+    };
+    let st = state.clone();
+    tokio::spawn(async move { broadcast_sync(&st, &event).await; });
+
     let image = write_campaign_image_file(&state, &id, &image_bytes).await?;
     state.store.campaign_image.write().await.insert(id, image);
 
@@ -1044,6 +1114,33 @@ async fn join_campaign(
     // Update caches (outside write_lock)
     state.store.invalidate_campaign(&campaign_id, &camp_snapshot).await;
 
+    // Sync to replicas
+    {
+        let closed = camp_snapshot.status == "closed";
+        let close_ids: Vec<String> = if closed {
+            camp_snapshot.participant_user_ids.iter().cloned().collect()
+        } else { Vec::new() };
+        let new_charges: Vec<SyncCharge> = if closed {
+            let charges = state.store.charges.read().await;
+            close_ids.iter().filter_map(|uid| {
+                charges.get(uid).and_then(|cs| cs.first()).map(|c| SyncCharge {
+                    user_id: uid.clone(), charge_id: c.id.clone(),
+                    campaign_id: c.campaign_id.clone(), campaign_name: c.campaign_name.clone(),
+                    campaign_price: c.campaign_price, created_at: c.created_at,
+                })
+            }).collect()
+        } else { Vec::new() };
+
+        let event = SyncEvent::CampaignJoined {
+            campaign_id: campaign_id.clone(), user_id: user_id_s.clone(),
+            user_name: { state.store.users.read().await.get(&user_id_s).map(|u| u.name.clone()).unwrap_or_default() },
+            joined_at: now, price, closed,
+            close_participant_ids: close_ids, new_charges,
+        };
+        let state2 = state.clone();
+        tokio::spawn(async move { broadcast_sync(&state2, &event).await; });
+    }
+
     // Synchronous DB write (for persistence / 追試). Lock already released.
     let participant_id = Uuid::new_v4().to_string();
     let mut tx = state.pool.begin().await?;
@@ -1140,6 +1237,12 @@ async fn create_saved_search(
     }
     tx.commit().await?;
 
+    let event = SyncEvent::SavedSearchCreated {
+        user_id: user_id_s, tag_ids: tag_id_vec.into_iter().collect(),
+    };
+    let st = state.clone();
+    tokio::spawn(async move { broadcast_sync(&st, &event).await; });
+
     Ok(StatusCode::CREATED)
 }
 
@@ -1158,4 +1261,109 @@ async fn list_charges(
         created_at: c.created_at,
     }).collect();
     Ok(Json(res))
+}
+
+// ── Internal sync ──
+
+async fn handle_sync(
+    State(state): State<AppState>,
+    Json(event): Json<SyncEvent>,
+) -> StatusCode {
+    match apply_sync_event(&state, event).await {
+        Ok(_) => StatusCode::OK,
+        Err(e) => { eprintln!("sync apply error: {e:?}"); StatusCode::INTERNAL_SERVER_ERROR }
+    }
+}
+
+async fn apply_sync_event(state: &AppState, event: SyncEvent) -> Result<(), AppError> {
+    match event {
+        SyncEvent::Reload => {
+            state.store.load_from_db(&state.pool).await?;
+        }
+        SyncEvent::UserCreated { id, name, credit_limit } => {
+            let _g = state.store.write_lock.lock().await;
+            state.store.users.write().await.insert(id, MemUser {
+                name, credit_limit, open_credit_used: 0,
+            });
+        }
+        SyncEvent::CampaignCreated { id, name, description, price, goal_count, created_at, tags, tag_ids } => {
+            let camp = MemCampaign {
+                name, description, price, goal_count, created_at, tags, tag_ids,
+                participants: Vec::new(), participant_user_ids: HashSet::new(),
+                status: "open".to_string(), last_joined_at: None,
+            };
+            let _g = state.store.write_lock.lock().await;
+            state.store.invalidate_campaign(&id, &camp).await;
+            state.store.campaigns.write().await.insert(id, camp);
+        }
+        SyncEvent::CampaignJoined {
+            campaign_id, user_id, user_name, joined_at, price,
+            closed, close_participant_ids, new_charges,
+        } => {
+            let _g = state.store.write_lock.lock().await;
+            let mut campaigns = state.store.campaigns.write().await;
+            let mut users = state.store.users.write().await;
+
+            if let Some(camp) = campaigns.get_mut(&campaign_id) {
+                if !camp.participant_user_ids.contains(&user_id) {
+                    camp.participants.push(ParticipantRes {
+                        user_id: user_id.clone(), name: user_name, joined_at,
+                    });
+                    camp.participant_user_ids.insert(user_id.clone());
+                    camp.last_joined_at = Some(joined_at);
+                    if let Some(u) = users.get_mut(&user_id) {
+                        u.open_credit_used += price;
+                    }
+                }
+                if closed {
+                    camp.status = "closed".to_string();
+                    for uid in &close_participant_ids {
+                        if let Some(u) = users.get_mut(uid) {
+                            u.open_credit_used -= price;
+                        }
+                    }
+                }
+            }
+
+            if !new_charges.is_empty() {
+                let mut charges = state.store.charges.write().await;
+                for sc in new_charges {
+                    charges.entry(sc.user_id).or_default().insert(0, ChargeEntry {
+                        id: sc.charge_id, amount: sc.campaign_price,
+                        campaign_id: sc.campaign_id, campaign_name: sc.campaign_name,
+                        campaign_price: sc.campaign_price, created_at: sc.created_at,
+                    });
+                }
+            }
+
+            if let Some(camp) = campaigns.get(&campaign_id) {
+                let camp_clone = camp.clone();
+                drop(campaigns);
+                drop(users);
+                state.store.invalidate_campaign(&campaign_id, &camp_clone).await;
+            }
+        }
+        SyncEvent::SavedSearchCreated { user_id, tag_ids } => {
+            let _g = state.store.write_lock.lock().await;
+            state.store.saved_searches.write().await
+                .entry(user_id).or_default()
+                .push(MemSavedSearch { tag_ids: tag_ids.into_iter().collect() });
+        }
+    }
+    Ok(())
+}
+
+async fn broadcast_sync(state: &AppState, event: &SyncEvent) {
+    if state.replica_urls.is_empty() { return; }
+    let body = match serde_json::to_vec(event) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    for url in state.replica_urls.iter() {
+        let target = format!("{url}/internal/sync");
+        let _ = state.http.post(&target)
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send().await;
+    }
 }
