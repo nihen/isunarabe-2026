@@ -1035,6 +1035,22 @@ async fn join_campaign(
     let user_id_s = user_id.to_string();
     let now = now_naive();
 
+    // Fast path: read-only checks (90% of joins fail here, no write lock needed)
+    {
+        let campaigns = state.store.campaigns.read().await;
+        let camp = campaigns.get(&campaign_id).ok_or(AppError::NotFound)?;
+        if camp.current_count() >= camp.goal_count { return Err(AppError::Conflict); }
+        if camp.participant_user_ids.contains(&user_id_s) { return Err(AppError::Conflict); }
+        let price = camp.price;
+        drop(campaigns);
+        let users = state.store.users.read().await;
+        let user = users.get(&user_id_s).ok_or(AppError::Unauthorized)?;
+        if user.open_credit_used + price > user.credit_limit {
+            return Err(AppError::PaymentRequired);
+        }
+    }
+
+    // Slow path: acquire write lock, re-check, and modify
     let _guard = state.store.write_lock.lock().await;
     let mut campaigns = state.store.campaigns.write().await;
     let mut users = state.store.users.write().await;
