@@ -305,7 +305,7 @@ fn serialize_dt_opt<S: Serializer>(dt: &Option<NaiveDateTime>, s: S) -> Result<S
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct CampaignRes {
     id: String,
     name: String,
@@ -358,6 +358,7 @@ async fn initialize(
     .await?;
 
     state.cache.clear_all().await;
+    warm_read_cache(&state).await?;
 
     Ok(Json(serde_json::json!({})))
 }
@@ -714,6 +715,107 @@ async fn fetch_participants_by_campaign(
             });
     }
     Ok(participants_by_campaign)
+}
+
+async fn warm_read_cache(state: &AppState) -> Result<(), AppError> {
+    let tag_rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM tags")
+        .fetch_all(&state.pool)
+        .await?;
+    let tags: Vec<String> = tag_rows.into_iter().map(|(name,)| name).collect();
+    *state.cache.tags_json.write().await = Some(serialize_json(&tags)?);
+
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        i32,
+        i32,
+        NaiveDateTime,
+        i64,
+        Option<NaiveDateTime>,
+    )> = sqlx::query_as(
+        "SELECT c.id, c.name, c.description, c.price, c.goal_count, c.created_at, \
+         COUNT(cp.id) AS current_count, MAX(cp.created_at) AS last_joined_at \
+         FROM campaigns c \
+         LEFT JOIN campaign_participants cp ON cp.campaign_id = c.id \
+         GROUP BY c.id, c.name, c.description, c.price, c.goal_count, c.created_at",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let campaign_ids: Vec<String> = rows.iter().map(|row| row.0.clone()).collect();
+    let tags_by_campaign = fetch_tags_by_campaign(&state.pool, &campaign_ids).await?;
+    let participants_by_campaign =
+        fetch_participants_by_campaign(&state.pool, &campaign_ids).await?;
+
+    let mut campaigns = Vec::with_capacity(rows.len());
+    for (id, name, description, price, goal_count, created_at, current_count, last_joined_at) in
+        rows
+    {
+        let status = if current_count as i32 >= goal_count {
+            "closed"
+        } else {
+            "open"
+        };
+        campaigns.push(CampaignRes {
+            tags: tags_by_campaign.get(&id).cloned().unwrap_or_default(),
+            participants: participants_by_campaign
+                .get(&id)
+                .cloned()
+                .unwrap_or_default(),
+            id,
+            name,
+            description,
+            price,
+            goal_count,
+            current_count: current_count as i32,
+            status: status.to_string(),
+            created_at,
+            last_joined_at,
+        });
+    }
+
+    let mut campaign_json = HashMap::with_capacity(campaigns.len());
+    for campaign in &campaigns {
+        campaign_json.insert(campaign.id.clone(), serialize_json(campaign)?);
+    }
+    *state.cache.campaign_json.write().await = campaign_json;
+
+    let mut open_campaigns: Vec<CampaignRes> = campaigns
+        .into_iter()
+        .filter(|campaign| campaign.status == "open")
+        .collect();
+    open_campaigns.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let latest: Vec<CampaignRes> = open_campaigns.iter().take(30).cloned().collect();
+
+    open_campaigns.sort_by(|a, b| {
+        let ak = a.last_joined_at.unwrap_or(a.created_at);
+        let bk = b.last_joined_at.unwrap_or(b.created_at);
+        bk.cmp(&ak)
+    });
+    let active: Vec<CampaignRes> = open_campaigns.iter().take(30).cloned().collect();
+
+    let mut list_cache = HashMap::new();
+    list_cache.insert("sort=new;tags=".to_string(), serialize_json(&latest)?);
+    list_cache.insert("sort=active;tags=".to_string(), serialize_json(&active)?);
+    *state.cache.list_campaigns_json.write().await = list_cache;
+
+    let image_rows: Vec<(String, Vec<u8>)> = sqlx::query_as("SELECT id, image FROM campaigns")
+        .fetch_all(&state.pool)
+        .await?;
+    let mut image_cache = HashMap::with_capacity(image_rows.len());
+    for (id, bytes) in image_rows {
+        let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(&bytes)));
+        image_cache.insert(
+            id,
+            ImageCache {
+                bytes: Arc::new(bytes),
+                etag,
+            },
+        );
+    }
+    *state.cache.campaign_image.write().await = image_cache;
+
+    Ok(())
 }
 
 #[derive(Deserialize)]
