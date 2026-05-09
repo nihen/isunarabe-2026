@@ -75,9 +75,16 @@ impl AppCache {
         self.list_campaigns_json.write().await.clear();
     }
 
-    async fn clear_user_views(&self) {
-        self.me_json.write().await.clear();
-        self.charges_json.write().await.clear();
+    async fn clear_users<'a, I>(&self, user_ids: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut me_json = self.me_json.write().await;
+        let mut charges_json = self.charges_json.write().await;
+        for user_id in user_ids {
+            me_json.remove(user_id);
+            charges_json.remove(user_id);
+        }
     }
 }
 
@@ -1075,6 +1082,7 @@ async fn join_campaign(
     let after = before + 1;
 
     let mut webhook_user_ids: Vec<String> = Vec::new();
+    let mut cache_clear_user_ids: HashSet<String> = HashSet::from([user_id.to_string()]);
     if after == goal_count - 1 {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT DISTINCT ss.user_id \
@@ -1091,12 +1099,13 @@ async fn join_campaign(
     }
 
     if after == goal_count {
-        let part_rows: Vec<(String,)> =
-            sqlx::query_as("SELECT id FROM campaign_participants WHERE campaign_id = ?")
+        let part_rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, user_id FROM campaign_participants WHERE campaign_id = ?")
                 .bind(&campaign_id)
                 .fetch_all(&mut *tx)
                 .await?;
-        for (pid,) in part_rows {
+        for (pid, uid) in part_rows {
+            cache_clear_user_ids.insert(uid);
             sqlx::query(
                 "INSERT INTO charges (id, campaign_participant_id, created_at) VALUES (?, ?, ?)",
             )
@@ -1125,7 +1134,10 @@ async fn join_campaign(
     tx.commit().await?;
 
     state.cache.clear_list_campaigns().await;
-    state.cache.clear_user_views().await;
+    state
+        .cache
+        .clear_users(cache_clear_user_ids.iter().map(String::as_str))
+        .await;
     state
         .cache
         .campaign_json
