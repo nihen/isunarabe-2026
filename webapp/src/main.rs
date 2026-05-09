@@ -1149,13 +1149,17 @@ async fn join_campaign(
         url_row.map(|(v,)| v).unwrap_or_default()
     };
 
-    tx.commit().await?;
-
+    // Invalidate caches BEFORE commit to prevent stale reads between commit and clear.
     state.cache.clear_list_campaigns().await;
     state
         .cache
         .clear_users(cache_clear_user_ids.iter().map(String::as_str))
         .await;
+    state.cache.campaign_json.write().await.remove(&campaign_id);
+
+    tx.commit().await?;
+
+    // Re-populate campaign cache with fresh data.
     state
         .cache
         .campaign_json
