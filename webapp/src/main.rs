@@ -47,8 +47,8 @@ struct DbConn {
     database: String,
 }
 
-#[derive(Clone, Copy)]
-struct AuthUser(Uuid);
+#[derive(Clone)]
+struct AuthUser(String);
 
 #[derive(Clone)]
 struct WebhookMessage {
@@ -586,12 +586,11 @@ async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    let header = req.headers().get("x-user-id")
+    let user_id = req.headers().get("x-user-id")
         .and_then(|v| v.to_str().ok())
-        .ok_or(AppError::Unauthorized)?;
-    let user_id = Uuid::parse_str(header).map_err(|_| AppError::Unauthorized)?;
-    let user_id_s = user_id.to_string();
-    if !state.store.users.read().await.contains_key(&user_id_s) {
+        .ok_or(AppError::Unauthorized)?
+        .to_string();
+    if !state.store.users.read().await.contains_key(&user_id) {
         return Err(AppError::Unauthorized);
     }
     req.extensions_mut().insert(AuthUser(user_id));
@@ -765,7 +764,7 @@ async fn get_me(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Json<MeRes>, AppError> {
-    let user_id_s = user_id.to_string();
+    let user_id_s = user_id;
     let users = state.store.users.read().await;
     let user = users.get(&user_id_s).ok_or(AppError::Unauthorized)?;
     Ok(Json(MeRes {
@@ -1030,9 +1029,9 @@ async fn join_campaign(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
     AxumPath(campaign_id): AxumPath<String>,
-    JsonReq(_): JsonReq<JoinReq>,
-) -> Result<Json<CampaignRes>, AppError> {
-    let user_id_s = user_id.to_string();
+    _body: axum::body::Bytes,
+) -> Result<Response, AppError> {
+    let user_id_s = user_id;
     let now = now_naive();
 
     let _guard = state.store.write_lock.lock().await;
@@ -1103,22 +1102,25 @@ async fn join_campaign(
         }
     }
 
-    let camp_snapshot = camp.clone();
     let response = camp.to_response(&campaign_id);
+    let response_bytes = Arc::new(serde_json::to_vec(&response)
+        .map_err(|e| AppError::Internal(format!("json: {e}")))?);
     let webhook_url = state.store.webhook_url.read().await.clone();
 
     drop(campaigns);
     drop(users);
     drop(_guard);
 
-    // Update caches (outside write_lock)
-    state.store.invalidate_campaign(&campaign_id, &camp_snapshot).await;
+    // Update caches (outside write_lock) — reuse serialized bytes
+    state.store.campaign_json_cache.write().await
+        .insert(campaign_id.clone(), response_bytes.clone());
+    state.store.list_cache.write().await.clear();
 
     // Sync to replicas
     {
-        let closed = camp_snapshot.status == "closed";
+        let closed = response.status == "closed";
         let close_ids: Vec<String> = if closed {
-            camp_snapshot.participant_user_ids.iter().cloned().collect()
+            response.participants.iter().map(|p| p.user_id.clone()).collect()
         } else { Vec::new() };
         let new_charges: Vec<SyncCharge> = if closed {
             let charges = state.store.charges.read().await;
@@ -1183,7 +1185,7 @@ async fn join_campaign(
         }
     }
 
-    Ok(Json(response))
+    Ok(response_from_json_bytes(response_bytes))
 }
 
 // ── Saved searches ──
@@ -1212,7 +1214,7 @@ async fn create_saved_search(
     }
     drop(tag_map);
 
-    let user_id_s = user_id.to_string();
+    let user_id_s = user_id;
     let _guard = state.store.write_lock.lock().await;
     let mut ss = state.store.saved_searches.write().await;
     let user_searches = ss.entry(user_id_s.clone()).or_default();
@@ -1251,7 +1253,7 @@ async fn list_charges(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Json<Vec<ChargeRes>>, AppError> {
-    let user_id_s = user_id.to_string();
+    let user_id_s = user_id;
     let charges = state.store.charges.read().await;
     let user_charges = charges.get(&user_id_s).cloned().unwrap_or_default();
     let res: Vec<ChargeRes> = user_charges.into_iter().map(|c| ChargeRes {
