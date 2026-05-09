@@ -8,6 +8,7 @@ MYSQL_PORT="${MYSQL_PORT:-13306}"
 APP_PORT="${APP_PORT:-18080}"
 DB_URL="mysql://isucon:isucon@127.0.0.1:${MYSQL_PORT}/nrb2026"
 TMP_SQL_DIR="$(mktemp -d)"
+TMP_IMAGE_DIR="$(mktemp -d)"
 APP_LOG="${TMPDIR:-/tmp}/nrb2026-regtest-app.log"
 APP_PID=""
 
@@ -18,6 +19,7 @@ cleanup() {
     fi
     docker rm -f "${MYSQL_CONTAINER}" >/dev/null 2>&1 || true
     rm -rf "${TMP_SQL_DIR}"
+    rm -rf "${TMP_IMAGE_DIR}"
 }
 trap cleanup EXIT
 
@@ -55,8 +57,14 @@ MYSQL_PWD=isucon mysql \
 
 DATABASE_URL="${DB_URL}" \
 SQL_DIR="${TMP_SQL_DIR}" \
+IMAGE_DIR="${TMP_IMAGE_DIR}" \
 PORT="${APP_PORT}" \
 cargo run --manifest-path "${ROOT_DIR}/Cargo.toml" >"${APP_LOG}" 2>&1 &
 APP_PID="$!"
 
 BASE_URL="http://127.0.0.1:${APP_PORT}" python3 "${ROOT_DIR}/tests/regulation_api_test.py"
+
+if [[ "$(find "${TMP_IMAGE_DIR}" -type f -name '*.jpg' | wc -l | tr -d ' ')" -eq 0 ]]; then
+    echo "no campaign images were written to IMAGE_DIR=${TMP_IMAGE_DIR}" >&2
+    exit 1
+fi

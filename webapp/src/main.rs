@@ -28,6 +28,7 @@ const DEFAULT_CREDIT_LIMIT: i32 = 60000;
 struct AppState {
     pool: MySqlPool,
     sql_dir: PathBuf,
+    image_dir: PathBuf,
     db: Arc<DbConn>,
     cache: Arc<AppCache>,
     webhook_tx: mpsc::Sender<WebhookMessage>,
@@ -65,7 +66,7 @@ struct AppCache {
 
 #[derive(Clone)]
 struct ImageCache {
-    bytes: Arc<Vec<u8>>,
+    path: PathBuf,
     etag: String,
 }
 
@@ -118,6 +119,9 @@ async fn main() {
     let sql_dir = std::env::var("SQL_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sql"));
+    let image_dir = std::env::var("IMAGE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("nrb2026-webapp-images"));
 
     let http = reqwest::Client::new();
     let (webhook_tx, webhook_rx) = mpsc::channel(8192);
@@ -126,6 +130,7 @@ async fn main() {
     let state = AppState {
         pool,
         sql_dir,
+        image_dir,
         db: Arc::new(db),
         cache: Arc::new(AppCache::default()),
         webhook_tx,
@@ -396,9 +401,53 @@ async fn initialize(
     .await?;
 
     state.cache.clear_all().await;
+    reset_image_dir(&state).await?;
     warm_read_cache(&state).await?;
 
     Ok(Json(serde_json::json!({})))
+}
+
+async fn reset_image_dir(state: &AppState) -> Result<(), AppError> {
+    match tokio::fs::remove_dir_all(&state.image_dir).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(AppError::Internal(format!(
+                "remove image dir {}: {e}",
+                state.image_dir.display()
+            )));
+        }
+    }
+    tokio::fs::create_dir_all(&state.image_dir)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "create image dir {}: {e}",
+                state.image_dir.display()
+            ))
+        })?;
+    Ok(())
+}
+
+async fn write_campaign_image_file(
+    state: &AppState,
+    campaign_id: &str,
+    bytes: &[u8],
+) -> Result<ImageCache, AppError> {
+    tokio::fs::create_dir_all(&state.image_dir)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "create image dir {}: {e}",
+                state.image_dir.display()
+            ))
+        })?;
+    let path = state.image_dir.join(format!("{campaign_id}.jpg"));
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|e| AppError::Internal(format!("write image {}: {e}", path.display())))?;
+    let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(bytes)));
+    Ok(ImageCache { path, etag })
 }
 
 async fn healthz(State(state): State<AppState>) -> StatusCode {
@@ -503,7 +552,12 @@ async fn get_me(
         credit_used: credit_used as i32,
     };
     let body = serialize_json(&res)?;
-    state.cache.me_json.write().await.insert(user_id_s, body.clone());
+    state
+        .cache
+        .me_json
+        .write()
+        .await
+        .insert(user_id_s, body.clone());
     Ok(response_from_json_bytes(body))
 }
 
@@ -604,7 +658,14 @@ async fn list_campaigns(
     };
     tag_ids.sort();
     let list_cache_key = format!("sort={sort_mode};tags={}", tag_ids.join(","));
-    if let Some(body) = state.cache.list_campaigns_json.read().await.get(&list_cache_key).cloned() {
+    if let Some(body) = state
+        .cache
+        .list_campaigns_json
+        .read()
+        .await
+        .get(&list_cache_key)
+        .cloned()
+    {
         return Ok(response_from_json_bytes(body));
     }
 
@@ -693,7 +754,12 @@ async fn list_campaigns(
         .collect();
 
     let body = serialize_json(&all)?;
-    state.cache.list_campaigns_json.write().await.insert(list_cache_key, body.clone());
+    state
+        .cache
+        .list_campaigns_json
+        .write()
+        .await
+        .insert(list_cache_key, body.clone());
     Ok(response_from_json_bytes(body))
 }
 
@@ -918,14 +984,8 @@ async fn warm_read_cache(state: &AppState) -> Result<(), AppError> {
         .await?;
     let mut image_cache = HashMap::with_capacity(image_rows.len());
     for (id, bytes) in image_rows {
-        let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(&bytes)));
-        image_cache.insert(
-            id,
-            ImageCache {
-                bytes: Arc::new(bytes),
-                etag,
-            },
-        );
+        let image = write_campaign_image_file(state, &id, &bytes).await?;
+        image_cache.insert(id, image);
     }
     *state.cache.campaign_image.write().await = image_cache;
 
@@ -1091,14 +1151,8 @@ async fn create_campaign(
         .write()
         .await
         .insert(id.clone(), serialize_json(&res)?);
-    let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(&image_bytes)));
-    state.cache.campaign_image.write().await.insert(
-        id,
-        ImageCache {
-            bytes: Arc::new(image_bytes),
-            etag,
-        },
-    );
+    let image = write_campaign_image_file(&state, &id, &image_bytes).await?;
+    state.cache.campaign_image.write().await.insert(id, image);
     Ok((StatusCode::CREATED, Json(res)))
 }
 
@@ -1109,7 +1163,7 @@ async fn get_campaign_image(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, AppError> {
     if let Some(image) = state.cache.campaign_image.read().await.get(&id).cloned() {
-        return Ok(image_response(image, &headers));
+        return image_response(image, &headers).await;
     }
 
     let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT image FROM campaigns WHERE id = ?")
@@ -1120,40 +1174,39 @@ async fn get_campaign_image(
         Some((b,)) => b,
         None => return Err(AppError::NotFound),
     };
-    let hash_hex = hex::encode(sha2::Sha256::digest(&bytes));
-    let etag = format!("\"{hash_hex}\"");
-    let image = ImageCache {
-        bytes: Arc::new(bytes),
-        etag,
-    };
+    let image = write_campaign_image_file(&state, &id, &bytes).await?;
     state
         .cache
         .campaign_image
         .write()
         .await
         .insert(id, image.clone());
-    Ok(image_response(image, &headers))
+    image_response(image, &headers).await
 }
 
-fn image_response(image: ImageCache, headers: &HeaderMap) -> Response {
+async fn image_response(image: ImageCache, headers: &HeaderMap) -> Result<Response, AppError> {
     let not_modified = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
         .map(|value| value == image.etag)
         .unwrap_or(false);
     if not_modified {
-        return (StatusCode::NOT_MODIFIED, [(header::ETAG, image.etag)]).into_response();
+        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, image.etag)]).into_response());
     }
 
-    (
+    let bytes = tokio::fs::read(&image.path)
+        .await
+        .map_err(|e| AppError::Internal(format!("read image {}: {e}", image.path.display())))?;
+
+    Ok((
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "image/jpeg".to_string()),
             (header::ETAG, image.etag),
         ],
-        Body::from(image.bytes.as_ref().clone()),
+        Body::from(bytes),
     )
-        .into_response()
+        .into_response())
 }
 
 async fn get_campaign(
@@ -1169,7 +1222,12 @@ async fn get_campaign(
         .await?
         .ok_or(AppError::NotFound)?;
     let body = serialize_json(&campaign)?;
-    state.cache.campaign_json.write().await.insert(id, body.clone());
+    state
+        .cache
+        .campaign_json
+        .write()
+        .await
+        .insert(id, body.clone());
     Ok(response_from_json_bytes(body))
 }
 
@@ -1306,8 +1364,15 @@ async fn join_campaign(
 
     // Single authority: safe to invalidate/update caches post-commit.
     state.cache.clear_list_campaigns().await;
-    state.cache.clear_users(cache_clear_user_ids.iter().map(String::as_str)).await;
-    state.cache.campaign_json.write().await
+    state
+        .cache
+        .clear_users(cache_clear_user_ids.iter().map(String::as_str))
+        .await;
+    state
+        .cache
+        .campaign_json
+        .write()
+        .await
         .insert(campaign_id.clone(), serialize_json(&response_campaign)?);
 
     if !webhook_user_ids.is_empty() && !webhook_url.is_empty() {
@@ -1418,7 +1483,14 @@ async fn list_charges(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Response, AppError> {
     let user_id_s = user_id.to_string();
-    if let Some(body) = state.cache.charges_json.read().await.get(&user_id_s).cloned() {
+    if let Some(body) = state
+        .cache
+        .charges_json
+        .read()
+        .await
+        .get(&user_id_s)
+        .cloned()
+    {
         return Ok(response_from_json_bytes(body));
     }
 
@@ -1447,7 +1519,12 @@ async fn list_charges(
         })
         .collect();
     let body = serialize_json(&res)?;
-    state.cache.charges_json.write().await.insert(user_id_s, body.clone());
+    state
+        .cache
+        .charges_json
+        .write()
+        .await
+        .insert(user_id_s, body.clone());
     Ok(response_from_json_bytes(body))
 }
 
