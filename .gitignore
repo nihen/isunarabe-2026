@@ -1,0 +1,17 @@
+# Rust build artifacts
+webapp/target/
+**/*.rs.bk
+
+# Large seed data (236M) — fetched separately via scripts/seed-fetch.sh
+webapp/sql/seed.sql
+
+# Local env / secrets
+.env
+.env.local
+scripts/.local/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
