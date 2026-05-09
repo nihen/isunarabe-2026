@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{FromRequest, Path as AxumPath, Query as AxumQuery, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
+use tokio::sync::RwLock;
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -29,6 +30,7 @@ struct AppState {
     sql_dir: PathBuf,
     db: Arc<DbConn>,
     http: reqwest::Client,
+    cache: Arc<AppCache>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +44,42 @@ struct DbConn {
 
 #[derive(Clone, Copy)]
 struct AuthUser(Uuid);
+
+#[derive(Default)]
+struct AppCache {
+    tags_json: RwLock<Option<Arc<Vec<u8>>>>,
+    campaign_json: RwLock<HashMap<String, Arc<Vec<u8>>>>,
+    campaign_image: RwLock<HashMap<String, ImageCache>>,
+    list_campaigns_json: RwLock<HashMap<String, Arc<Vec<u8>>>>,
+    me_json: RwLock<HashMap<String, Arc<Vec<u8>>>>,
+    charges_json: RwLock<HashMap<String, Arc<Vec<u8>>>>,
+}
+
+#[derive(Clone)]
+struct ImageCache {
+    bytes: Arc<Vec<u8>>,
+    etag: String,
+}
+
+impl AppCache {
+    async fn clear_all(&self) {
+        *self.tags_json.write().await = None;
+        self.campaign_json.write().await.clear();
+        self.campaign_image.write().await.clear();
+        self.list_campaigns_json.write().await.clear();
+        self.me_json.write().await.clear();
+        self.charges_json.write().await.clear();
+    }
+
+    async fn clear_list_campaigns(&self) {
+        self.list_campaigns_json.write().await.clear();
+    }
+
+    async fn clear_user_views(&self) {
+        self.me_json.write().await.clear();
+        self.charges_json.write().await.clear();
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -67,6 +105,7 @@ async fn main() {
         sql_dir,
         db: Arc::new(db),
         http,
+        cache: Arc::new(AppCache::default()),
     };
 
     let unauthed_api = Router::new()
@@ -166,6 +205,20 @@ impl From<sqlx::Error> for AppError {
     fn from(e: sqlx::Error) -> Self {
         AppError::Internal(format!("sqlx: {e}"))
     }
+}
+
+fn response_from_json_bytes(body: Arc<Vec<u8>>) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        Body::from(body.as_ref().clone()),
+    )
+        .into_response()
+}
+
+fn serialize_json<T: Serialize>(value: &T) -> Result<Arc<Vec<u8>>, AppError> {
+    let bytes = serde_json::to_vec(value).map_err(|e| AppError::Internal(format!("json: {e}")))?;
+    Ok(Arc::new(bytes))
 }
 
 struct JsonReq<T>(T);
@@ -304,6 +357,8 @@ async fn initialize(
     .execute(&state.pool)
     .await?;
 
+    state.cache.clear_all().await;
+
     Ok(Json(serde_json::json!({})))
 }
 
@@ -386,22 +441,35 @@ struct MeRes {
 async fn get_me(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
-) -> Result<Json<MeRes>, AppError> {
+) -> Result<Response, AppError> {
+    let user_id_s = user_id.to_string();
+    if let Some(body) = state.cache.me_json.read().await.get(&user_id_s).cloned() {
+        return Ok(response_from_json_bytes(body));
+    }
+
     let row: Option<(String, i32)> =
         sqlx::query_as("SELECT name, credit_limit FROM users WHERE id = ?")
-            .bind(user_id.to_string())
+            .bind(&user_id_s)
             .fetch_optional(&state.pool)
             .await?;
     let (name, credit_limit) = row.ok_or(AppError::Unauthorized)?;
 
-    let credit_used = fetch_open_credit_used(&state.pool, &user_id.to_string()).await?;
+    let credit_used = fetch_open_credit_used(&state.pool, &user_id_s).await?;
 
-    Ok(Json(MeRes {
-        id: user_id.to_string(),
+    let res = MeRes {
+        id: user_id_s.clone(),
         name,
         credit_limit,
         credit_used: credit_used as i32,
-    }))
+    };
+    let body = serialize_json(&res)?;
+    state
+        .cache
+        .me_json
+        .write()
+        .await
+        .insert(user_id_s, body.clone());
+    Ok(response_from_json_bytes(body))
 }
 
 async fn fetch_open_credit_used(pool: &MySqlPool, user_id: &str) -> Result<i64, AppError> {
@@ -422,11 +490,18 @@ async fn fetch_open_credit_used(pool: &MySqlPool, user_id: &str) -> Result<i64, 
     Ok(credit_used)
 }
 
-async fn list_tags(State(state): State<AppState>) -> Result<Json<Vec<String>>, AppError> {
+async fn list_tags(State(state): State<AppState>) -> Result<Response, AppError> {
+    if let Some(body) = state.cache.tags_json.read().await.clone() {
+        return Ok(response_from_json_bytes(body));
+    }
+
     let rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM tags")
         .fetch_all(&state.pool)
         .await?;
-    Ok(Json(rows.into_iter().map(|(n,)| n).collect()))
+    let tags: Vec<String> = rows.into_iter().map(|(n,)| n).collect();
+    let body = serialize_json(&tags)?;
+    *state.cache.tags_json.write().await = Some(body.clone());
+    Ok(response_from_json_bytes(body))
 }
 
 #[derive(Deserialize)]
@@ -438,8 +513,8 @@ struct ListCampaignsQuery {
 async fn list_campaigns(
     State(state): State<AppState>,
     AxumQuery(q): AxumQuery<ListCampaignsQuery>,
-) -> Result<Json<Vec<CampaignRes>>, AppError> {
-    let tag_ids: Vec<String> = match q.tags.as_deref() {
+) -> Result<Response, AppError> {
+    let mut tag_ids: Vec<String> = match q.tags.as_deref() {
         Some(s) if !s.is_empty() => {
             let parts: Vec<String> = s.split(',').map(|p| p.to_string()).collect();
             if parts.len() > 3 {
@@ -470,6 +545,18 @@ async fn list_campaigns(
         Some("new") | None => "new",
         _ => return Err(AppError::BadRequest),
     };
+    tag_ids.sort();
+    let list_cache_key = format!("sort={sort_mode};tags={}", tag_ids.join(","));
+    if let Some(body) = state
+        .cache
+        .list_campaigns_json
+        .read()
+        .await
+        .get(&list_cache_key)
+        .cloned()
+    {
+        return Ok(response_from_json_bytes(body));
+    }
 
     let mut qb = QueryBuilder::<MySql>::new(
         "SELECT c.id, c.name, c.description, c.price, c.goal_count, c.created_at, \
@@ -514,7 +601,7 @@ async fn list_campaigns(
     let participants_by_campaign =
         fetch_participants_by_campaign(&state.pool, &campaign_ids).await?;
 
-    let all = rows
+    let all: Vec<CampaignRes> = rows
         .into_iter()
         .map(
             |(
@@ -550,7 +637,14 @@ async fn list_campaigns(
         )
         .collect();
 
-    Ok(Json(all))
+    let body = serialize_json(&all)?;
+    state
+        .cache
+        .list_campaigns_json
+        .write()
+        .await
+        .insert(list_cache_key, body.clone());
+    Ok(response_from_json_bytes(body))
 }
 
 async fn fetch_tags_by_campaign(
@@ -705,14 +799,34 @@ async fn create_campaign(
     let res = hydrate_campaign_via_pool(&state.pool, &id)
         .await?
         .ok_or(AppError::Internal("created campaign vanished".into()))?;
+    state.cache.clear_list_campaigns().await;
+    state
+        .cache
+        .campaign_json
+        .write()
+        .await
+        .insert(id.clone(), serialize_json(&res)?);
+    let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(&image_bytes)));
+    state.cache.campaign_image.write().await.insert(
+        id,
+        ImageCache {
+            bytes: Arc::new(image_bytes),
+            etag,
+        },
+    );
     Ok((StatusCode::CREATED, Json(res)))
 }
 
 async fn get_campaign_image(
     State(state): State<AppState>,
     Extension(_user): Extension<AuthUser>,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, AppError> {
+    if let Some(image) = state.cache.campaign_image.read().await.get(&id).cloned() {
+        return Ok(image_response(image, &headers));
+    }
+
     let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT image FROM campaigns WHERE id = ?")
         .bind(&id)
         .fetch_optional(&state.pool)
@@ -723,26 +837,60 @@ async fn get_campaign_image(
     };
     let hash_hex = hex::encode(sha2::Sha256::digest(&bytes));
     let etag = format!("\"{hash_hex}\"");
-    Ok((
+    let image = ImageCache {
+        bytes: Arc::new(bytes),
+        etag,
+    };
+    state
+        .cache
+        .campaign_image
+        .write()
+        .await
+        .insert(id, image.clone());
+    Ok(image_response(image, &headers))
+}
+
+fn image_response(image: ImageCache, headers: &HeaderMap) -> Response {
+    let not_modified = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value == image.etag)
+        .unwrap_or(false);
+    if not_modified {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, image.etag)]).into_response();
+    }
+
+    (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "image/jpeg"),
-            (header::ETAG, etag.as_str()),
+            (header::CONTENT_TYPE, "image/jpeg".to_string()),
+            (header::ETAG, image.etag),
         ],
-        Body::from(bytes),
+        Body::from(image.bytes.as_ref().clone()),
     )
-        .into_response())
+        .into_response()
 }
 
 async fn get_campaign(
     State(state): State<AppState>,
     Extension(_user): Extension<AuthUser>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<CampaignRes>, AppError> {
-    match hydrate_campaign_via_pool(&state.pool, &id).await? {
-        Some(c) => Ok(Json(c)),
-        None => Err(AppError::NotFound),
+) -> Result<Response, AppError> {
+    if let Some(body) = state.cache.campaign_json.read().await.get(&id).cloned() {
+        return Ok(response_from_json_bytes(body));
     }
+
+    let campaign = hydrate_campaign_via_pool(&state.pool, &id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let body = serialize_json(&campaign)?;
+    state
+        .cache
+        .campaign_json
+        .write()
+        .await
+        .insert(id, body.clone());
+    Ok(response_from_json_bytes(body))
 }
 
 #[derive(Deserialize)]
@@ -874,6 +1022,15 @@ async fn join_campaign(
 
     tx.commit().await?;
 
+    state.cache.clear_list_campaigns().await;
+    state.cache.clear_user_views().await;
+    state
+        .cache
+        .campaign_json
+        .write()
+        .await
+        .insert(campaign_id.clone(), serialize_json(&response_campaign)?);
+
     if !webhook_user_ids.is_empty() && !webhook_url.is_empty() {
         for uid in &webhook_user_ids {
             let body = serde_json::json!({
@@ -991,7 +1148,19 @@ struct ChargeCampaign {
 async fn list_charges(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
-) -> Result<Json<Vec<ChargeRes>>, AppError> {
+) -> Result<Response, AppError> {
+    let user_id_s = user_id.to_string();
+    if let Some(body) = state
+        .cache
+        .charges_json
+        .read()
+        .await
+        .get(&user_id_s)
+        .cloned()
+    {
+        return Ok(response_from_json_bytes(body));
+    }
+
     let rows: Vec<(String, NaiveDateTime, String, String, i32)> = sqlx::query_as(
         "SELECT ch.id, ch.created_at, c.id, c.name, c.price \
          FROM charges ch \
@@ -1000,7 +1169,7 @@ async fn list_charges(
          WHERE cp.user_id = ? \
          ORDER BY ch.created_at DESC",
     )
-    .bind(user_id.to_string())
+    .bind(&user_id_s)
     .fetch_all(&state.pool)
     .await?;
     let res: Vec<ChargeRes> = rows
@@ -1016,7 +1185,14 @@ async fn list_charges(
             created_at: ca,
         })
         .collect();
-    Ok(Json(res))
+    let body = serialize_json(&res)?;
+    state
+        .cache
+        .charges_json
+        .write()
+        .await
+        .insert(user_id_s, body.clone());
+    Ok(response_from_json_bytes(body))
 }
 
 async fn hydrate_campaign(
