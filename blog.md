@@ -43,10 +43,12 @@ Claude Code と Codex は同時に別セッションで動かしていた。Clau
 
 > alhena profileのawsへのアクセスできるか確認して
 > → isuconの練習のisunarabeをこれからはじめるので /Users/chiba/Downloads/cloudformation.yml で構築おねがい！
+> → （EIP上限でロールバック）
+> → /Users/chiba/Downloads/isunarabe_accessKeys.csv べつのaws環境用意した
 > → ssh isucon@3.115.92.38 で繋いでみて
 > → コードを手元にもってきてgit管理しつつ、deploy, bench走行までをscript化して
 
-CloudFormation でサーバー構築を指示したが、いきなり **EIP（固定IP）の上限に到達**してスタック作成がロールバックされた。Claude Code が既存 EIP を確認し、別の AWS アカウントを用意して再挑戦。SSH 接続確認、コード取得、deploy/bench スクリプト整備まで一気にやらせた。開始早々のトラブルだったが、AI が原因特定→対処案提示まで自走してくれたので助かった。
+いきなり **EIP（固定IP）の上限に到達**してスタック作成がロールバックされた。Claude Code が原因を特定して報告してきたので、別の AWS アカウントのアクセスキーを渡して再挑戦。SSH 接続確認、コード取得、deploy/bench スクリプト整備まで一気にやらせた。
 
 **初回ベンチ & 構成決定（Claude Code）**
 
