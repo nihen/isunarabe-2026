@@ -104,15 +104,16 @@ impl MemCampaign {
     }
 
     fn to_response(&self, id: &str) -> CampaignRes {
+        let cc = self.current_count();
         CampaignRes {
             id: id.to_string(),
             name: self.name.clone(),
             description: self.description.clone(),
             price: self.price,
             goal_count: self.goal_count,
-            current_count: self.current_count(),
+            current_count: cc,
             tags: self.tags.clone(),
-            status: self.status.clone(),
+            status: if cc >= self.goal_count { "closed" } else { "open" }.to_string(),
             created_at: self.created_at,
             last_joined_at: self.last_joined_at,
             participants: self.participants.clone(),
@@ -1359,9 +1360,22 @@ async fn broadcast_sync(state: &AppState, event: &SyncEvent) {
     };
     for url in state.replica_urls.iter() {
         let target = format!("{url}/internal/sync");
-        let _ = state.http.post(&target)
-            .header("content-type", "application/json")
-            .body(body.clone())
-            .send().await;
+        for attempt in 0..3 {
+            match state.http.post(&target)
+                .header("content-type", "application/json")
+                .body(body.clone())
+                .send().await
+            {
+                Ok(resp) if resp.status().is_success() => break,
+                Ok(resp) => {
+                    eprintln!("sync to {target}: HTTP {} (attempt {attempt})", resp.status());
+                    if attempt == 2 { eprintln!("sync FAILED after 3 attempts"); }
+                }
+                Err(e) => {
+                    eprintln!("sync to {target}: {e} (attempt {attempt})");
+                    if attempt == 2 { eprintln!("sync FAILED after 3 attempts"); }
+                }
+            }
+        }
     }
 }
