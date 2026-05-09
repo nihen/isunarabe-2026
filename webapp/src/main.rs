@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use axum::{
     body::Body,
     extract::{FromRequest, Path as AxumPath, Query as AxumQuery, Request, State},
@@ -51,6 +54,7 @@ enum DbWrite {
         created_at: NaiveDateTime,
     },
 }
+use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -450,8 +454,10 @@ impl Store {
             tag_ids.sort();
             let tag_key = tag_ids.join(",");
 
-            cache.insert(format!("sort=new;tags={tag_key}"), json_to_gzip(&by_new));
-            cache.insert(format!("sort=active;tags={tag_key}"), json_to_gzip(&by_active));
+            let new_bytes = serde_json::to_vec(&by_new).unwrap_or_default();
+            let active_bytes = serde_json::to_vec(&by_active).unwrap_or_default();
+            cache.insert(format!("sort=new;tags={tag_key}"), Bytes::from(new_bytes));
+            cache.insert(format!("sort=active;tags={tag_key}"), Bytes::from(active_bytes));
         }
 
         drop(d);
@@ -461,7 +467,7 @@ impl Store {
     }
 
     fn invalidate_campaign(&self, campaign_id: &str, camp: &MemCampaign) {
-        let bytes = json_to_gzip(&camp.to_response(campaign_id));
+        let bytes = Bytes::from(serde_json::to_vec(&camp.to_response(campaign_id)).unwrap_or_default());
         self.campaign_json_cache.write()
             .insert(campaign_id.to_string(), bytes);
         self.list_cache.write().clear();
@@ -553,7 +559,7 @@ async fn main() {
         let serve = ServeDir::new(&dir).not_found_service(ServeFile::new(index));
         app = app.fallback_service(serve);
     }
-    let app = app.with_state(state);
+    let app = app.with_state(state).layer(CompressionLayer::new().gzip(true));
 
     let port: u16 = std::env::var("PORT")
         .unwrap_or_else(|_| "8080".to_string())
@@ -866,7 +872,7 @@ async fn get_me(
     {
         let d = state.store.data.read();
         if let Some(cached) = d.me_cache.get(&user_id_s) {
-            return Ok(response_gzipped_json(cached.clone()));
+            return Ok(response_from_json_bytes(cached.clone()));
         }
     }
     // Cache miss: build and store
@@ -879,9 +885,9 @@ async fn get_me(
         credit_used: user.open_credit_used,
     };
     drop(d);
-    let bytes = json_to_gzip(&result);
+    let bytes = Bytes::from(serde_json::to_vec(&result).map_err(|e| AppError::Internal(format!("json: {e}")))?);
     state.store.data.write().me_cache.insert(user_id_s, bytes.clone());
-    Ok(response_gzipped_json(bytes))
+    Ok(response_from_json_bytes(bytes))
 }
 
 // ── Tags ──
@@ -895,27 +901,6 @@ async fn list_tags(State(state): State<AppState>) -> Result<Json<Vec<String>>, A
 
 #[derive(Deserialize)]
 struct ListCampaignsQuery { tags: Option<String>, sort: Option<String> }
-
-fn gzip_compress(data: &[u8]) -> Bytes {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 2), Compression::fast());
-    encoder.write_all(data).unwrap();
-    Bytes::from(encoder.finish().unwrap())
-}
-
-fn json_to_gzip(data: &impl Serialize) -> Bytes {
-    let raw = serde_json::to_vec(data).unwrap_or_default();
-    gzip_compress(&raw)
-}
-
-fn response_gzipped_json(body: Bytes) -> Response {
-    (StatusCode::OK, [
-        (header::CONTENT_TYPE, "application/json"),
-        (header::CONTENT_ENCODING, "gzip"),
-    ], Body::from(body)).into_response()
-}
 
 fn response_from_json_bytes(body: Bytes) -> Response {
     (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")],
@@ -955,7 +940,7 @@ async fn list_campaigns(
 
     // Check cache
     if let Some(body) = state.store.list_cache.read().get(&cache_key).cloned() {
-        return Ok(response_gzipped_json(body));
+        return Ok(response_from_json_bytes(body));
     }
 
     // Cache miss: compute just this key
@@ -978,9 +963,9 @@ async fn list_campaigns(
         open.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     }
     open.truncate(30);
-    let bytes = json_to_gzip(&open);
+    let bytes = Bytes::from(serde_json::to_vec(&open).unwrap_or_default());
     state.store.list_cache.write().insert(cache_key, bytes.clone());
-    Ok(response_gzipped_json(bytes))
+    Ok(response_from_json_bytes(bytes))
 }
 
 async fn get_campaign(
@@ -990,15 +975,15 @@ async fn get_campaign(
 ) -> Result<Response, AppError> {
     // Check pre-serialized cache
     if let Some(body) = state.store.campaign_json_cache.read().get(&id).cloned() {
-        return Ok(response_gzipped_json(body));
+        return Ok(response_from_json_bytes(body));
     }
     let d = state.store.data.read();
     let camp = d.campaigns.get(&id).ok_or(AppError::NotFound)?;
     let res = camp.to_response(&id);
     drop(d);
-    let body = json_to_gzip(&res);
+    let body = Bytes::from(serde_json::to_vec(&res).map_err(|e| AppError::Internal(format!("json: {e}")))?);
     state.store.campaign_json_cache.write().insert(id, body.clone());
-    Ok(response_gzipped_json(body))
+    Ok(response_from_json_bytes(body))
 }
 
 // ── Campaign image ──
@@ -1231,7 +1216,8 @@ async fn join_campaign(
 
         let camp = d.campaigns.get(&campaign_id).unwrap();
         let response = camp.to_response(&campaign_id);
-        let response_bytes = json_to_gzip(&response);
+        let response_bytes = Bytes::from(serde_json::to_vec(&response)
+            .map_err(|e| AppError::Internal(format!("json: {e}")))?);
         let webhook_url = d.webhook_url.clone();
         let new_charges_sync = Vec::<SyncCharge>::new();
 
@@ -1296,7 +1282,7 @@ async fn join_campaign(
         }
     }
 
-    Ok(response_gzipped_json(response_bytes))
+    Ok(response_from_json_bytes(response_bytes))
 }
 
 // ── Saved searches ──
