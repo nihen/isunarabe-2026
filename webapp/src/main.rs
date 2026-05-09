@@ -122,14 +122,15 @@ struct MemUser {
 
 #[derive(Clone)]
 struct MemCampaign {
-    name: String,
-    description: String,
+    name: Arc<str>,
+    description: Arc<str>,
     price: i32,
     goal_count: i32,
     created_at: NaiveDateTime,
-    tags: Vec<String>,
+    created_at_str: Arc<str>,
+    tags: Arc<[String]>,
     tag_ids: Vec<String>,
-    participants: Vec<ParticipantRes>,
+    participants: Vec<Arc<ParticipantRes>>,
     participant_user_ids: HashSet<String>,
     status: String,
     last_joined_at: Option<NaiveDateTime>,
@@ -144,16 +145,16 @@ impl MemCampaign {
         let cc = self.current_count();
         CampaignRes {
             id: id.to_string(),
-            name: self.name.clone(),
-            description: self.description.clone(),
+            name: self.name.to_string(),
+            description: self.description.to_string(),
             price: self.price,
             goal_count: self.goal_count,
             current_count: cc,
-            tags: self.tags.clone(),
+            tags: self.tags.to_vec(),
             status: if cc >= self.goal_count { "closed" } else { "open" }.to_string(),
             created_at: self.created_at,
             last_joined_at: self.last_joined_at,
-            participants: self.participants.clone(),
+            participants: self.participants.iter().map(|p| p.as_ref().clone()).collect(),
         }
     }
 }
@@ -270,8 +271,9 @@ impl Store {
         let mut campaigns: HashMap<String, MemCampaign> = HashMap::with_capacity(camp_rows.len());
         for (id, name, description, price, goal_count, created_at) in camp_rows {
             campaigns.insert(id, MemCampaign {
-                name, description, price, goal_count, created_at,
-                tags: Vec::new(), tag_ids: Vec::new(),
+                name: Arc::from(name.as_str()), description: Arc::from(description.as_str()),
+                price, goal_count, created_at, created_at_str: Arc::from(fmt_dt(created_at).as_str()),
+                tags: Arc::from(Vec::new().as_slice()), tag_ids: Vec::new(),
                 participants: Vec::new(), participant_user_ids: HashSet::new(),
                 status: "open".to_string(), last_joined_at: None,
             });
@@ -281,12 +283,18 @@ impl Store {
         let ct_rows: Vec<(String, String)> =
             sqlx::query_as("SELECT campaign_id, tag_id FROM campaign_tags")
                 .fetch_all(pool).await?;
+        let mut tags_by_camp: HashMap<String, Vec<String>> = HashMap::new();
         for (cid, tid) in ct_rows {
             if let Some(camp) = campaigns.get_mut(&cid) {
                 if let Some(name) = tag_name_by_id.get(&tid) {
-                    camp.tags.push(name.clone());
+                    tags_by_camp.entry(cid.clone()).or_default().push(name.clone());
                 }
                 camp.tag_ids.push(tid);
+            }
+        }
+        for (cid, tags) in tags_by_camp {
+            if let Some(camp) = campaigns.get_mut(&cid) {
+                camp.tags = Arc::from(tags.as_slice());
             }
         }
 
@@ -299,9 +307,9 @@ impl Store {
         .fetch_all(pool).await?;
         for (cid, uid, uname, joined_at) in part_rows {
             if let Some(camp) = campaigns.get_mut(&cid) {
-                camp.participants.push(ParticipantRes {
+                camp.participants.push(Arc::new(ParticipantRes {
                     user_id: uid.clone(), name: uname, joined_at,
-                });
+                }));
                 camp.participant_user_ids.insert(uid);
                 camp.last_joined_at = Some(joined_at);
             }
@@ -1068,9 +1076,10 @@ async fn create_campaign(
     });
 
     let camp = MemCampaign {
-        name: req.name, description: req.description, price: req.price,
-        goal_count: req.goal_count, created_at: now,
-        tags: req.tags, tag_ids,
+        name: Arc::from(req.name.as_str()), description: Arc::from(req.description.as_str()),
+        price: req.price, goal_count: req.goal_count, created_at: now,
+        created_at_str: Arc::from(fmt_dt(now).as_str()),
+        tags: Arc::from(req.tags.as_slice()), tag_ids,
         participants: Vec::new(), participant_user_ids: HashSet::new(),
         status: "open".to_string(), last_joined_at: None,
     };
@@ -1082,9 +1091,9 @@ async fn create_campaign(
     state.store.invalidate_campaign(&id, &camp_clone);
 
     let event = SyncEvent::CampaignCreated {
-        id: id.clone(), name: camp_clone.name, description: camp_clone.description,
+        id: id.clone(), name: camp_clone.name.to_string(), description: camp_clone.description.to_string(),
         price: camp_clone.price, goal_count: camp_clone.goal_count,
-        created_at: camp_clone.created_at, tags: camp_clone.tags, tag_ids: camp_clone.tag_ids,
+        created_at: camp_clone.created_at, tags: camp_clone.tags.to_vec(), tag_ids: camp_clone.tag_ids,
     };
     broadcast_sync(&state, &event).await;
 
@@ -1136,9 +1145,9 @@ async fn join_campaign(
 
         // Phase 2: Add participant + credit + close (all mutations)
         let camp = d.campaigns.get_mut(&campaign_id).unwrap();
-        camp.participants.push(ParticipantRes {
+        camp.participants.push(Arc::new(ParticipantRes {
             user_id: user_id_s.clone(), name: user_name.clone(), joined_at: now,
-        });
+        }));
         camp.participant_user_ids.insert(user_id_s.clone());
         camp.last_joined_at = Some(now);
         let after = camp.current_count();
@@ -1150,7 +1159,7 @@ async fn join_campaign(
             let camp = d.campaigns.get_mut(&campaign_id).unwrap();
             camp.status = "closed".to_string();
             let participant_uids: Vec<String> = camp.participant_user_ids.iter().cloned().collect();
-            let camp_name = camp.name.clone();
+            let camp_name = camp.name.to_string();
             for uid in &participant_uids {
                 if let Some(u) = d.users.get_mut(uid) {
                     u.open_credit_used -= price;
@@ -1348,7 +1357,9 @@ async fn apply_sync_event(state: &AppState, event: SyncEvent) -> Result<(), AppE
         }
         SyncEvent::CampaignCreated { id, name, description, price, goal_count, created_at, tags, tag_ids } => {
             let camp = MemCampaign {
-                name, description, price, goal_count, created_at, tags, tag_ids,
+                name: Arc::from(name.as_str()), description: Arc::from(description.as_str()),
+                price, goal_count, created_at, created_at_str: Arc::from(fmt_dt(created_at).as_str()),
+                tags: Arc::from(tags.as_slice()), tag_ids,
                 participants: Vec::new(), participant_user_ids: HashSet::new(),
                 status: "open".to_string(), last_joined_at: None,
             };
@@ -1367,9 +1378,9 @@ async fn apply_sync_event(state: &AppState, event: SyncEvent) -> Result<(), AppE
                 {
                     if let Some(camp) = d.campaigns.get_mut(&campaign_id) {
                         if !camp.participant_user_ids.contains(&user_id) {
-                            camp.participants.push(ParticipantRes {
+                            camp.participants.push(Arc::new(ParticipantRes {
                                 user_id: user_id.clone(), name: user_name, joined_at,
-                            });
+                            }));
                             camp.participant_user_ids.insert(user_id.clone());
                             camp.last_joined_at = Some(joined_at);
                             need_credit_add = true;
