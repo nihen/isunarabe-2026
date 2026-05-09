@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # Sync local webapp/ to target server(s), build (release), and restart the service.
+# Default targets = all 3 (nrb2026-3 also runs webapp so /api/initialize can hit local mysql).
+#
 # Usage:
-#   scripts/deploy.sh            # all 3 servers in parallel (default)
-#   scripts/deploy.sh 1          # only nrb2026-1
-#   scripts/deploy.sh 1 3        # nrb2026-1 and -3
-#   PROFILE=debug scripts/deploy.sh   # cargo run (debug, current default systemd unit)
-#   PROFILE=release scripts/deploy.sh # cargo build --release; expects unit pointing at target/release/webapp
+#   scripts/deploy.sh                   # all 3 in parallel (default)
+#   scripts/deploy.sh app               # APP_SERVERS only (nrb2026-1, -2)
+#   scripts/deploy.sh db                # DB_SERVER only (nrb2026-3)
+#   scripts/deploy.sh 1                 # only nrb2026-1
+#   scripts/deploy.sh 1 2               # nrb2026-1 and -2
+#   PROFILE=debug scripts/deploy.sh     # cargo run (debug; matches current unit default)
+#   PROFILE=release scripts/deploy.sh   # cargo build --release; needs unit pointing at target/release/webapp
 #
 # Notes:
-# - seed.sql is excluded — it's not pushed on every deploy. Use scripts/seed-fetch.sh / seed-push.sh.
-# - public/ is the SPA, regulation forbids editing it but we still rsync to keep parity.
+# - seed.sql is excluded — fetch with scripts/seed-fetch.sh.
+# - public/ is the SPA; regulation forbids editing it.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -42,7 +46,7 @@ deploy_one() {
   echo "[deploy ${tag}] done."
 }
 
-# Resolve targets
+# Resolve targets — default = all 3, since nrb2026-3 also runs webapp (for fast initialize).
 targets=()
 if [ "$#" -eq 0 ]; then
   mapfile -t targets < <(resolve_targets all)

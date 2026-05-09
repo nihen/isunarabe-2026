@@ -1,0 +1,5 @@
+# Deployed to /etc/mysql/mysql.conf.d/isucon.cnf on the DB server (nrb2026-3).
+# Restart mysql.service after changes.
+[mysqld]
+bind-address = 0.0.0.0
+max_connections = 1000
