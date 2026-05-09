@@ -110,6 +110,7 @@ def request_json(
         status = e.code
         response_headers = {k.lower(): v for k, v in e.headers.items()}
         payload = e.read()
+        e.close()
 
     if status != expected:
         raise ApiError(
@@ -139,6 +140,7 @@ def request_bytes(
         status = e.code
         response_headers = {k.lower(): v for k, v in e.headers.items()}
         payload = e.read()
+        e.close()
     if status != expected:
         raise ApiError(
             f"{method} {path}: expected {expected}, got {status}, body={payload[:500]!r}"

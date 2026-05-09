@@ -640,7 +640,12 @@ async fn list_campaigns(
                     goal_count,
                     current_count,
                     tags,
-                    status: if current_count >= goal_count { "closed" } else { "open" }.to_string(),
+                    status: if current_count >= goal_count {
+                        "closed"
+                    } else {
+                        "open"
+                    }
+                    .to_string(),
                     created_at,
                     last_joined_at,
                     participants,
