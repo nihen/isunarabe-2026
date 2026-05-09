@@ -53,6 +53,8 @@ struct WebhookMessage {
 
 #[derive(Default)]
 struct AppCache {
+    user_ids: RwLock<HashSet<String>>,
+    tag_ids_by_name: RwLock<HashMap<String, String>>,
     tags_json: RwLock<Option<Arc<Vec<u8>>>>,
     campaign_json: RwLock<HashMap<String, Arc<Vec<u8>>>>,
     campaign_image: RwLock<HashMap<String, ImageCache>>,
@@ -69,6 +71,8 @@ struct ImageCache {
 
 impl AppCache {
     async fn clear_all(&self) {
+        self.user_ids.write().await.clear();
+        self.tag_ids_by_name.write().await.clear();
         *self.tags_json.write().await = None;
         self.campaign_json.write().await.clear();
         self.campaign_image.write().await.clear();
@@ -91,6 +95,10 @@ impl AppCache {
             me_json.remove(user_id);
             charges_json.remove(user_id);
         }
+    }
+
+    async fn insert_user(&self, user_id: String) {
+        self.user_ids.write().await.insert(user_id);
     }
 }
 
@@ -274,13 +282,20 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .ok_or(AppError::Unauthorized)?;
     let user_id = Uuid::parse_str(header).map_err(|_| AppError::Unauthorized)?;
+    let user_id_s = user_id.to_string();
+    if state.cache.user_ids.read().await.contains(&user_id_s) {
+        req.extensions_mut().insert(AuthUser(user_id));
+        return Ok(next.run(req).await);
+    }
+
     let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM users WHERE id = ?")
-        .bind(user_id.to_string())
+        .bind(&user_id_s)
         .fetch_optional(&state.pool)
         .await?;
     if exists.is_none() {
         return Err(AppError::Unauthorized);
     }
+    state.cache.insert_user(user_id_s).await;
     req.extensions_mut().insert(AuthUser(user_id));
     Ok(next.run(req).await)
 }
@@ -447,6 +462,7 @@ async fn create_user(
         .bind(now)
         .execute(&state.pool)
         .await?;
+    state.cache.insert_user(id.clone()).await;
     Ok(Json(UserRes {
         id,
         name: req.name,
@@ -509,17 +525,48 @@ async fn fetch_open_credit_used(pool: &MySqlPool, user_id: &str) -> Result<i64, 
     Ok(credit_used)
 }
 
+async fn resolve_tag_ids(state: &AppState, tag_names: &[String]) -> Result<Vec<String>, AppError> {
+    let cached = state.cache.tag_ids_by_name.read().await;
+    if !cached.is_empty() {
+        let mut tag_ids = Vec::with_capacity(tag_names.len());
+        for name in tag_names {
+            let tag_id = cached.get(name).ok_or(AppError::BadRequest)?;
+            tag_ids.push(tag_id.clone());
+        }
+        return Ok(tag_ids);
+    }
+    drop(cached);
+
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, id FROM tags")
+        .fetch_all(&state.pool)
+        .await?;
+    let tag_ids_by_name: HashMap<String, String> = rows.into_iter().collect();
+    let mut tag_ids = Vec::with_capacity(tag_names.len());
+    for name in tag_names {
+        let tag_id = tag_ids_by_name.get(name).ok_or(AppError::BadRequest)?;
+        tag_ids.push(tag_id.clone());
+    }
+    *state.cache.tag_ids_by_name.write().await = tag_ids_by_name;
+    Ok(tag_ids)
+}
+
 async fn list_tags(State(state): State<AppState>) -> Result<Response, AppError> {
     if let Some(body) = state.cache.tags_json.read().await.clone() {
         return Ok(response_from_json_bytes(body));
     }
 
-    let rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM tags")
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, id FROM tags")
         .fetch_all(&state.pool)
         .await?;
-    let tags: Vec<String> = rows.into_iter().map(|(n,)| n).collect();
+    let mut tags = Vec::with_capacity(rows.len());
+    let mut tag_ids_by_name = HashMap::with_capacity(rows.len());
+    for (name, id) in rows {
+        tags.push(name.clone());
+        tag_ids_by_name.insert(name, id);
+    }
     let body = serialize_json(&tags)?;
     *state.cache.tags_json.write().await = Some(body.clone());
+    *state.cache.tag_ids_by_name.write().await = tag_ids_by_name;
     Ok(response_from_json_bytes(body))
 }
 
@@ -545,16 +592,7 @@ async fn list_campaigns(
                     return Err(AppError::BadRequest);
                 }
             }
-            let mut tag_ids = Vec::with_capacity(parts.len());
-            for p in &parts {
-                let r: Option<(String,)> = sqlx::query_as("SELECT id FROM tags WHERE name = ?")
-                    .bind(p)
-                    .fetch_optional(&state.pool)
-                    .await?;
-                let (tag_id,) = r.ok_or(AppError::BadRequest)?;
-                tag_ids.push(tag_id);
-            }
-            tag_ids
+            resolve_tag_ids(&state, &parts).await?
         }
         _ => Vec::new(),
     };
@@ -729,11 +767,25 @@ async fn fetch_participants_by_campaign(
 }
 
 async fn warm_read_cache(state: &AppState) -> Result<(), AppError> {
-    let tag_rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM tags")
+    let tag_rows: Vec<(String, String)> = sqlx::query_as("SELECT name, id FROM tags")
         .fetch_all(&state.pool)
         .await?;
-    let tags: Vec<String> = tag_rows.into_iter().map(|(name,)| name).collect();
+    let mut tags = Vec::with_capacity(tag_rows.len());
+    let mut tag_ids_by_name = HashMap::with_capacity(tag_rows.len());
+    for (name, id) in tag_rows {
+        tags.push(name.clone());
+        tag_ids_by_name.insert(name, id);
+    }
     *state.cache.tags_json.write().await = Some(serialize_json(&tags)?);
+    *state.cache.tag_ids_by_name.write().await = tag_ids_by_name;
+
+    let user_rows: Vec<(String,)> = sqlx::query_as("SELECT id FROM users")
+        .fetch_all(&state.pool)
+        .await?;
+    *state.cache.user_ids.write().await = user_rows
+        .into_iter()
+        .map(|(id,)| id)
+        .collect::<HashSet<_>>();
 
     let rows: Vec<(
         String,
@@ -868,22 +920,7 @@ async fn create_campaign(
         }
     }
     let image_bytes = validate_jpeg_image_b64(&req.image)?;
-    let mut tag_ids: Vec<String> = Vec::new();
-    for t in &req.tags {
-        let r: Option<(String,)> = sqlx::query_as("SELECT id FROM tags WHERE name = ?")
-            .bind(t)
-            .fetch_optional(&state.pool)
-            .await?;
-        match r {
-            Some((tid,)) => {
-                if tag_ids.iter().any(|id| id == &tid) {
-                    return Err(AppError::BadRequest);
-                }
-                tag_ids.push(tid);
-            }
-            None => return Err(AppError::BadRequest),
-        }
-    }
+    let tag_ids = resolve_tag_ids(&state, &req.tags).await?;
 
     let id = Uuid::new_v4().to_string();
     let now = now_naive();
@@ -1190,22 +1227,7 @@ async fn create_saved_search(
             return Err(AppError::BadRequest);
         }
     }
-    let mut tag_ids: Vec<String> = Vec::new();
-    for t in &req.tags {
-        let r: Option<(String,)> = sqlx::query_as("SELECT id FROM tags WHERE name = ?")
-            .bind(t)
-            .fetch_optional(&state.pool)
-            .await?;
-        match r {
-            Some((tid,)) => {
-                if tag_ids.iter().any(|id| id == &tid) {
-                    return Err(AppError::BadRequest);
-                }
-                tag_ids.push(tid);
-            }
-            None => return Err(AppError::BadRequest),
-        }
-    }
+    let tag_ids = resolve_tag_ids(&state, &req.tags).await?;
 
     let mut tx = state.pool.begin().await?;
     sqlx::query("SELECT id FROM users WHERE id = ? FOR UPDATE")
