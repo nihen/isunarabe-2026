@@ -67,6 +67,11 @@ struct Store {
     webhook_url: RwLock<String>,
     campaign_image: RwLock<HashMap<String, ImageCache>>,
     write_lock: Mutex<()>,
+    // Pre-computed list responses (rebuilt on join/create, not on every list request)
+    list_cache_dirty: RwLock<bool>,
+    list_cache: RwLock<HashMap<String, Arc<Vec<u8>>>>,
+    // Pre-serialized campaign responses
+    campaign_json_cache: RwLock<HashMap<String, Arc<Vec<u8>>>>,
 }
 
 #[derive(Clone)]
@@ -147,6 +152,9 @@ impl Store {
             webhook_url: RwLock::new(String::new()),
             campaign_image: RwLock::new(HashMap::new()),
             write_lock: Mutex::new(()),
+            list_cache_dirty: RwLock::new(true),
+            list_cache: RwLock::new(HashMap::new()),
+            campaign_json_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -289,7 +297,89 @@ impl Store {
         // Clear image cache (will warm lazily)
         self.campaign_image.write().await.clear();
 
+        // Rebuild list cache + campaign JSON cache
+        *self.list_cache_dirty.write().await = true;
+        self.campaign_json_cache.write().await.clear();
+        self.rebuild_list_cache_if_dirty().await;
+
         Ok(())
+    }
+
+    async fn rebuild_list_cache_if_dirty(&self) {
+        {
+            let dirty = self.list_cache_dirty.read().await;
+            if !*dirty { return; }
+        }
+
+        let campaigns = self.campaigns.read().await;
+        let tag_map = self.tag_id_by_name.read().await;
+
+        let open: Vec<(String, &MemCampaign)> = campaigns.iter()
+            .filter(|(_, c)| c.status == "open")
+            .map(|(id, c)| (id.clone(), c))
+            .collect();
+
+        let mut cache = HashMap::new();
+        let tag_names: Vec<&String> = tag_map.keys().collect();
+
+        // Build all tag combinations (0, 1, 2, 3 tags)
+        let mut tag_combos: Vec<Vec<&str>> = vec![vec![]]; // empty = no filter
+        for name in &tag_names {
+            tag_combos.push(vec![name.as_str()]);
+        }
+        for i in 0..tag_names.len() {
+            for j in i+1..tag_names.len() {
+                tag_combos.push(vec![tag_names[i].as_str(), tag_names[j].as_str()]);
+                for k in j+1..tag_names.len() {
+                    tag_combos.push(vec![tag_names[i].as_str(), tag_names[j].as_str(), tag_names[k].as_str()]);
+                }
+            }
+        }
+
+        for combo in &tag_combos {
+            let filtered: Vec<CampaignRes> = open.iter()
+                .filter(|(_, c)| combo.iter().all(|tag| c.tags.iter().any(|t| t == tag)))
+                .map(|(id, c)| c.to_response(id))
+                .collect();
+
+            // sort=new
+            let mut by_new = filtered.clone();
+            by_new.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            by_new.truncate(30);
+
+            // sort=active
+            let mut by_active = filtered;
+            by_active.sort_by(|a, b| {
+                let ak = a.last_joined_at.unwrap_or(a.created_at);
+                let bk = b.last_joined_at.unwrap_or(b.created_at);
+                bk.cmp(&ak)
+            });
+            by_active.truncate(30);
+
+            let mut tag_ids: Vec<&str> = combo.iter()
+                .filter_map(|name| tag_map.get(*name).map(|id| id.as_str()))
+                .collect();
+            tag_ids.sort();
+            let tag_key = tag_ids.join(",");
+
+            let new_bytes = serde_json::to_vec(&by_new).unwrap_or_default();
+            let active_bytes = serde_json::to_vec(&by_active).unwrap_or_default();
+            cache.insert(format!("sort=new;tags={tag_key}"), Arc::new(new_bytes));
+            cache.insert(format!("sort=active;tags={tag_key}"), Arc::new(active_bytes));
+        }
+
+        drop(campaigns);
+        drop(tag_map);
+
+        *self.list_cache.write().await = cache;
+        *self.list_cache_dirty.write().await = false;
+    }
+
+    async fn invalidate_campaign(&self, campaign_id: &str, camp: &MemCampaign) {
+        let bytes = serde_json::to_vec(&camp.to_response(campaign_id)).unwrap_or_default();
+        self.campaign_json_cache.write().await
+            .insert(campaign_id.to_string(), Arc::new(bytes));
+        *self.list_cache_dirty.write().await = true;
     }
 }
 
@@ -301,7 +391,7 @@ async fn main() {
         .unwrap_or_else(|_| "mysql://isucon:isucon@127.0.0.1:3306/nrb2026".to_string());
     let db = parse_db_url(&dsn);
     let pool = MySqlPoolOptions::new()
-        .max_connections(128)
+        .max_connections(16)
         .connect(&dsn)
         .await
         .expect("connect to MySQL");
@@ -636,11 +726,16 @@ async fn list_tags(State(state): State<AppState>) -> Result<Json<Vec<String>>, A
 #[derive(Deserialize)]
 struct ListCampaignsQuery { tags: Option<String>, sort: Option<String> }
 
+fn response_from_json_bytes(body: Arc<Vec<u8>>) -> Response {
+    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")],
+     Body::from(body.as_ref().clone())).into_response()
+}
+
 async fn list_campaigns(
     State(state): State<AppState>,
     AxumQuery(q): AxumQuery<ListCampaignsQuery>,
-) -> Result<Json<Vec<CampaignRes>>, AppError> {
-    let filter_tag_names: Vec<String> = match q.tags.as_deref() {
+) -> Result<Response, AppError> {
+    let mut tag_ids: Vec<String> = match q.tags.as_deref() {
         Some(s) if !s.is_empty() => {
             let parts: Vec<String> = s.split(',').map(|p| p.to_string()).collect();
             if parts.len() > 3 { return Err(AppError::BadRequest); }
@@ -649,10 +744,11 @@ async fn list_campaigns(
                 if !seen.insert(p.clone()) { return Err(AppError::BadRequest); }
             }
             let tag_map = state.store.tag_id_by_name.read().await;
+            let mut ids = Vec::new();
             for p in &parts {
-                if !tag_map.contains_key(p) { return Err(AppError::BadRequest); }
+                ids.push(tag_map.get(p).ok_or(AppError::BadRequest)?.clone());
             }
-            parts
+            ids
         }
         _ => Vec::new(),
     };
@@ -663,15 +759,29 @@ async fn list_campaigns(
         _ => return Err(AppError::BadRequest),
     };
 
+    tag_ids.sort();
+    let cache_key = format!("sort={sort_mode};tags={}", tag_ids.join(","));
+
+    // Rebuild if dirty
+    state.store.rebuild_list_cache_if_dirty().await;
+
+    let cache = state.store.list_cache.read().await;
+    if let Some(body) = cache.get(&cache_key) {
+        return Ok(response_from_json_bytes(body.clone()));
+    }
+    drop(cache);
+
+    // Fallback: compute on demand (shouldn't happen if rebuild covers all combos)
     let campaigns = state.store.campaigns.read().await;
+    let filter_tag_names: Vec<String> = {
+        let tag_name_map = state.store.tag_name_by_id.read().await;
+        tag_ids.iter().filter_map(|id| tag_name_map.get(id).cloned()).collect()
+    };
     let mut open: Vec<CampaignRes> = campaigns.iter()
         .filter(|(_, c)| c.status == "open")
-        .filter(|(_, c)| {
-            filter_tag_names.iter().all(|tag| c.tags.contains(tag))
-        })
+        .filter(|(_, c)| filter_tag_names.iter().all(|tag| c.tags.contains(tag)))
         .map(|(id, c)| c.to_response(id))
         .collect();
-
     if sort_mode == "active" {
         open.sort_by(|a, b| {
             let ak = a.last_joined_at.unwrap_or(a.created_at);
@@ -682,18 +792,27 @@ async fn list_campaigns(
         open.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     }
     open.truncate(30);
-
-    Ok(Json(open))
+    let bytes = serde_json::to_vec(&open).unwrap_or_default();
+    Ok(response_from_json_bytes(Arc::new(bytes)))
 }
 
 async fn get_campaign(
     State(state): State<AppState>,
     Extension(_user): Extension<AuthUser>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<CampaignRes>, AppError> {
+) -> Result<Response, AppError> {
+    // Check pre-serialized cache
+    if let Some(body) = state.store.campaign_json_cache.read().await.get(&id) {
+        return Ok(response_from_json_bytes(body.clone()));
+    }
     let campaigns = state.store.campaigns.read().await;
     let camp = campaigns.get(&id).ok_or(AppError::NotFound)?;
-    Ok(Json(camp.to_response(&id)))
+    let res = camp.to_response(&id);
+    drop(campaigns);
+    let bytes = serde_json::to_vec(&res).map_err(|e| AppError::Internal(format!("json: {e}")))?;
+    let body = Arc::new(bytes);
+    state.store.campaign_json_cache.write().await.insert(id, body.clone());
+    Ok(response_from_json_bytes(body))
 }
 
 // ── Campaign image ──
@@ -820,10 +939,13 @@ async fn create_campaign(
         status: "open".to_string(), last_joined_at: None,
     };
     let res = camp.to_response(&id);
+    let camp_clone = camp.clone();
 
     let _guard = state.store.write_lock.lock().await;
     state.store.campaigns.write().await.insert(id.clone(), camp);
     drop(_guard);
+
+    state.store.invalidate_campaign(&id, &camp_clone).await;
 
     let image = write_campaign_image_file(&state, &id, &image_bytes).await?;
     state.store.campaign_image.write().await.insert(id, image);
@@ -913,12 +1035,16 @@ async fn join_campaign(
         }
     }
 
+    let camp_snapshot = camp.clone();
     let response = camp.to_response(&campaign_id);
     let webhook_url = state.store.webhook_url.read().await.clone();
 
     drop(campaigns);
     drop(users);
     drop(_guard);
+
+    // Update caches (outside write_lock)
+    state.store.invalidate_campaign(&campaign_id, &camp_snapshot).await;
 
     // Synchronous DB write (for persistence / 追試). Lock already released.
     let participant_id = Uuid::new_v4().to_string();
