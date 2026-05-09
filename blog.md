@@ -39,31 +39,49 @@ AI との協働で一番効いたのは、**失敗を前提にした試行回数
 
 Claude Code と Codex は同時に別セッションで動かしていた。Claude Code がメインの長大セッション（12:15〜18:25、プロンプト100回以上）を担当し、Codex は worktree で並行作業していた。
 
-**環境構築（Claude Code, 12:15〜）**
+### 実際のプロンプト例
+
+今回の趣旨は「AI Agent 無制限で何が起こるのか」なので、人間が AI にどんな指示を出していたかも載せておく。以下は実際のプロンプトで、時系列順に並べている。引用ブロック（`>`）が人間のプロンプト、地の文がその背景と結果だ。
+
+Claude Code と Codex は同時に別セッションで動かしていた。Claude Code がメインの長大セッション（12:15〜18:25、プロンプト100回以上）を担当し、Codex は worktree で並行作業していた。
+
+#### 環境構築（Claude Code, 12:15〜）
 
 > alhena profileのawsへのアクセスできるか確認して
-> → isuconの練習のisunarabeをこれからはじめるので /Users/chiba/Downloads/cloudformation.yml で構築おねがい！
-> → （EIP上限でロールバック）
-> → /Users/chiba/Downloads/isunarabe_accessKeys.csv べつのaws環境用意した
-> → ssh isucon@3.115.92.38 で繋いでみて
-> → コードを手元にもってきてgit管理しつつ、deploy, bench走行までをscript化して
 
-いきなり **EIP（固定IP）の上限に到達**してスタック作成がロールバックされた。Claude Code が原因を特定して報告してきたので、別の AWS アカウントのアクセスキーを渡して再挑戦。SSH 接続確認、コード取得、deploy/bench スクリプト整備まで一気にやらせた。
+> isuconの練習のisunarabeをこれからはじめるので /Users/chiba/Downloads/cloudformation.yml で構築おねがい！
 
-**初回ベンチ & 構成決定（Claude Code）**
+いきなり EIP（固定IP）の上限に到達してスタック作成がロールバックされた。Claude Code が原因を特定して報告してきた。
+
+> /Users/chiba/Downloads/isunarabe_accessKeys.csv べつのaws環境用意した
+
+別の AWS アカウントのアクセスキーを渡して再挑戦。
+
+> ssh isucon@3.115.92.38 で繋いでみて
+
+> コードを手元にもってきてgit管理しつつ、deploy, bench走行までをscript化して
+
+SSH 接続確認、コード取得、deploy/bench スクリプト整備まで一気にやらせた。
+
+#### 初回ベンチ & 構成決定（Claude Code）
 
 > app, app, mysql構成にしよか
-> → nginx導入して
-> → benchを2にうった。監視してみて
-> → 結果でたよ。38,300
 
-38,300 がスタートライン。ここから553倍の旅が始まった。
+> nginx導入して
 
-**Codex への並行投入（Codex, 12:58〜）**
+> benchを2にうった。監視してみて
+
+> 結果でたよ。38,300
+
+38,300 がスタートライン。ここから572倍の旅が始まった。
+
+#### Codex への並行投入（Codex, 12:58〜）
 
 > webappを解説して
-> → 理論上最速にするためのプランを .plansにかいて
-> → ok, いったんworktreeでphaseごとにコミットをがんがんいれていって。cherry-pickは別働隊でやるので
+
+> 理論上最速にするためのプランを .plansにかいて
+
+> ok, いったんworktreeでphaseごとにコミットをがんがんいれていって。cherry-pickは別働隊でやるので
 
 Codex にコード解説→設計プラン策定→worktree での実装を一気に投げた。`.plans/webapp-theoretical-fastest-plan.md`（515行、Phase 1〜8）が生成され、これがその後の全作業の骨格になった。骨子:
 
@@ -78,92 +96,101 @@ Codex にコード解説→設計プラン策定→worktree での実装を一�
 
 Claude Code がメインセッションで戦いながら、Codex が worktree で先行実装を進める。cherry-pick で取り込む二正面作戦だった。
 
-**取り込みと試行錯誤（Claude Code）**
+#### 取り込みと試行錯誤（Claude Code）
 
 > codexに最適化をコミットしてもらっているのでこれを展開して
-> → worktreeでcodexが最適化をすすめているので、順次取り込み->bench確認していこか
-> → utta（ベンチ実行を伝える短縮語）
+
+> worktreeでcodexが最適化をすすめているので、順次取り込み->bench確認していこか
+
+> utta
 
 Codex の成果物を cherry-pick で取り込み、ベンチで検証するサイクル。「utta」は「ベンチ打った」の省略で、セッション中に何十回も出てくる。
 
-**方針転換の瞬間（Claude Code）**
+#### 方針転換の瞬間（Claude Code）
 
 > MYSQL依存なくせる？
-> → いや君自身がやって。
-> → まず１台構成での最適化をすすめつつ、最終的には３台での水平分散にすすんで
 
-DB 依存をなくす in-memory 化を指示。Claude Code に「案を出して」ではなく「やって」と言った瞬間だ。
+> いや君自身がやって。
 
-**水平分散の議論と断念（Claude Code, Session 3）**
+> まず１台構成での最適化をすすめつつ、最終的には３台での水平分散にすすんで
+
+DB 依存をなくす in-memory 化を指示。Claude Code に「案を出して」ではなく「やって」と言った瞬間。
+
+#### 水平分散の議論と断念（Claude Code）
 
 > X-User-IDの情報をもとにnginxが水平分散する最適化案はありうるか
-> → .plansにかいて！
-> → benchの対象が１サーバーにしかできないのよ。L2 proxyみたいなことしてnginx負荷を分散できないかな？
+
+> .plansにかいて！
+
+> benchの対象が１サーバーにしかできないのよ。L2 proxyみたいなことしてnginx負荷を分散できないかな？
 
 水平分散のあらゆる案を議論した末、credit_used の一貫性問題で断念。single authority に回帰した。
 
-**Zig リライトの発注（Codex, 15:58〜）**
+#### Zig リライトの発注（Codex, 15:58〜）
 
 > brantchきってworktreeで作業はじめて
-> → rewrite-zigブランチで
-> → zigでwebappをかきなおして。理論上最速の書き方で
 
-3行で Zig フルリライトが始まった。結果は 15M で不採用:
+> rewrite-zigブランチで
+
+> zigでwebappをかきなおして。理論上最速の書き方で
+
+3行で Zig フルリライトが始まった。結果は 15M で不採用。
 
 > かてるとおもう？というかrust版をそのまま開発したがほういいとおもう？
-> → rust版にもどすのはふつうにdeployすればいいだけ？main thread claudecodeにつたえる言葉をおしえて
-> → もどした。その間、開発だけはすすめておこ。zig版。
 
-不採用でも開発は続けさせた。AI のリソースは余っているから、「念のため並行で進めておく」判断ができる。最終的に Zig 版からの知見は Rust 版に還元された:
+> もどした。その間、開発だけはすすめておこ。zig版。
+
+不採用でも開発は続けさせた。AI のリソースは余っているから、「念のため並行で進めておく」判断ができる。
 
 > 逆にあなたがとりくんだことで、rust側にできるアドバイスはあるか
-> → rustへの提案 .plansにかいておいて
 
-**nginx 排除の発想（Claude Code）**
+> rustへの提案 .plansにかいておいて
+
+最終的に Zig 版からの知見は Rust 版に還元された。
+
+#### nginx 排除の発想（Claude Code）
 
 > nginxの機能をwebappにもたせて、nginx排除したほうがよかったりするかな？
-> → app1に直接むけるので、nginxをそもそもなくせる？
+
+> app1に直接むけるので、nginxをそもそもなくせる？
 
 nginx のオーバーヘッドに気づき、webapp に gzip を持たせて nginx を排除する構成に切り替えた。これで 20M 台が安定した。
 
-**Oracle + マルチレビュー（Claude Code, 現セッション）**
+#### Oracle + マルチレビュー（Claude Code, 現セッション 18:25〜）
 
 > oracleのレビュー結果を実装おねがい！
-> → alp分析とperf分析したい
-> → コスト気にせずとにかく限界までチューニングしてお願い
-> → さっきのalp/perf結果をともなって、multi review, oracleして
 
-perf/alp の結果を踏まえて、Claude Code が自分で優先順位を立てて AppState Arc 化、ahash 導入、手動 datetime フォーマット、user_ids 分離を一括実装した。
+GPT-5.5 Pro のパフォーマンスレビュー結果をそのまま渡して実装させた。
 
-**レビュー依頼**
+> alp分析とperf分析したい
+
+ssh でサーバーに入り、nginx を一時的に有効化して LTSV ログを取り、alp と perf record を同時実行。
+
+> コスト気にせずとにかく限界までチューニングしてお願い
+
+perf の結果を踏まえて、Claude Code が自分で優先順位を立てて AppState Arc 化、ahash 導入、手動 datetime フォーマット、user_ids 分離を一括実装した。
 
 > さっきのalp/perf結果をともなって、multi review, oracleして
 
-7つの AI エージェント (Claude, Codex, Gemini, Copilot, Cursor Agent, DeepSeek V4, Kimi K2.6) に並列でコードレビューを投げつつ、GPT-5.5 Pro にもセカンドオピニオンを求めた。結果を統合して「複数エージェントが共通で指摘した項目」を優先的に実装した。
-
-**戦略相談**
+7エージェント並列レビュー + GPT-5.5 Pro セカンドオピニオン。結果を統合して「複数エージェントが共通で指摘した項目」を優先的に実装した。
 
 > 21,372,000 他チームのハイスコアだからこれをこえたいんだよね。
 
-このひと言で、Claude Code が残りの最適化候補をスコアインパクト順に整理し直して提案してきた。「me_cache の global lock 解放が最も効果が高い」という分析が返ってきた。
-
-**リスク管理**
+残りの最適化候補をスコアインパクト順に整理し直して提案してきた。
 
 > 20時JSTがリミットで、最後のベンチデータが採用されるから、そこ意識して。スコア下がったら戻せるように。
 
-時間制約を伝えると、Claude Code がコミットしてからデプロイする運用に切り替え、revert コマンドを事前に準備した。
-
-**micro opt 依頼**
+時間制約を伝えると、コミットしてからデプロイする運用に切り替え、revert コマンドを事前に準備した。
 
 > なにかほかにできることあるか
 
-Claude Code が「不要サービスの停止」「journald の volatile 化」「THP=never」などの OS レベルのチューニングを提案・実行した。
-
-**ブレーキ**
+「不要サービスの停止」「journald の volatile 化」「THP=never」などの OS チューニングを提案・実行した。
 
 > ちょっと！ベンチ実行中にdeployしないで！
 
-ベンチ中にデプロイしてスコアを壊した場面。この後 Claude Code は「ベンチ完了を確認してからデプロイ」を学習した。AI は便利だが、暴走を止めるのは人間の仕事だ。
+ベンチ中にデプロイしてスコアを壊した場面。この後「ベンチ完了を確認してからデプロイ」を学習した。AI は便利だが、暴走を止めるのは人間の仕事だ。
+
+---
 
 ポイントは、**プロンプトが短い**ことだ。「oracleのレビュー結果を実装おねがい！」で十分に伝わる。なぜなら、Claude Code はこのセッション中のすべてのコンテキスト（コード、perf 結果、過去のベンチスコア、失敗した施策）を持っているからだ。長い指示書を書く必要はなく、方針と判断基準だけ伝えればよかった。
 
