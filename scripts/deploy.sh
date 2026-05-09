@@ -1,64 +1,49 @@
 #!/usr/bin/env bash
-# Sync local webapp/ to target server(s), build (release), and restart the service.
-# Default targets = all 3 (nrb2026-3 also runs webapp so /api/initialize can hit local mysql).
+# Deploy webapp to target server(s): rsync + cargo build --release + restart.
 #
 # Usage:
-#   scripts/deploy.sh                   # all 3 in parallel (default)
-#   scripts/deploy.sh app               # APP_SERVERS only (nrb2026-1, -2)
-#   scripts/deploy.sh db                # DB_SERVER only (nrb2026-3)
-#   scripts/deploy.sh 1                 # only nrb2026-1
-#   scripts/deploy.sh 1 2               # nrb2026-1 and -2
-#   PROFILE=debug scripts/deploy.sh     # cargo run (debug; matches current unit default)
-#   PROFILE=release scripts/deploy.sh   # cargo build --release; needs unit pointing at target/release/webapp
-#
-# Notes:
-# - seed.sql is excluded — fetch with scripts/seed-fetch.sh.
-# - public/ is the SPA; regulation forbids editing it.
+#   scripts/deploy.sh            # authority (1) + replica (2) in parallel
+#   scripts/deploy.sh 1          # only nrb2026-1
+#   scripts/deploy.sh 2          # only nrb2026-2
+#   scripts/deploy.sh 1 2        # both
+#   scripts/deploy.sh all        # all 3 (including DB host)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 source scripts/hosts.sh
 
-PROFILE="${PROFILE:-debug}"
 SERVICE="nrb2026-webapp.service"
 
 deploy_one() {
   local host="$1"
-  local tag="${host}"
-
-  echo "[deploy ${tag}] rsync -> ${host}"
+  echo "[deploy ${host}] rsync"
   rsync -az --delete \
-    --exclude target \
-    --exclude .git \
-    --exclude 'sql/seed.sql' \
+    --exclude target --exclude .git --exclude 'sql/seed.sql' \
     -e "ssh ${SSH_OPTS[*]}" \
     ./webapp/ "${SSH_USER}@${host}:/home/isucon/webapp/"
 
-  if [ "$PROFILE" = "release" ]; then
-    echo "[deploy ${tag}] cargo build --release"
-    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" \
-      'cd ~/webapp && ~/.cargo/bin/cargo build --release --bin webapp'
-  fi
+  echo "[deploy ${host}] cargo build --release"
+  ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" \
+    'cd ~/webapp && ~/.cargo/bin/cargo build --release --bin webapp 2>&1 | tail -2'
 
-  echo "[deploy ${tag}] systemctl restart ${SERVICE}"
+  echo "[deploy ${host}] restart"
   ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" "sudo systemctl restart ${SERVICE}"
-
-  echo "[deploy ${tag}] done."
+  echo "[deploy ${host}] done"
 }
 
-# Resolve targets — default = all 3, since nrb2026-3 also runs webapp (for fast initialize).
+# Default: authority (1) + replica (2)
 targets=()
 if [ "$#" -eq 0 ]; then
-  mapfile -t targets < <(resolve_targets all)
+  targets=("${SERVERS[0]}" "${SERVERS[1]}")
 else
   for arg in "$@"; do
-    targets+=("$(resolve_targets "$arg")")
+    mapfile -t resolved < <(resolve_targets "$arg")
+    targets+=("${resolved[@]}")
   done
 fi
 
-echo "[deploy] profile=${PROFILE}, targets: ${targets[*]}"
+echo "[deploy] targets: ${targets[*]}"
 
-# Run in parallel, fail if any fails.
 pids=()
 for host in "${targets[@]}"; do
   deploy_one "$host" &

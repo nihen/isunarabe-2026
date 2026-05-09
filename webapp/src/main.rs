@@ -691,9 +691,8 @@ async fn initialize(
     reset_image_dir(&state).await?;
     state.store.load_from_db(&state.pool).await?;
 
-    // Tell replicas to reload
-    let st = state.clone();
-    tokio::spawn(async move { broadcast_sync(&st, &SyncEvent::Reload).await; });
+    // Tell replicas to reload (synchronous — must complete before bench starts)
+    broadcast_sync(&state, &SyncEvent::Reload).await;
 
     Ok(Json(serde_json::json!({})))
 }
