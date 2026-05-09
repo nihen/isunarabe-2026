@@ -57,7 +57,7 @@ Claude Code と Codex は同時に別セッションで動かしていた。Clau
 
 別の AWS アカウントのアクセスキーを渡して再挑戦。
 
-> ssh isucon@3.115.92.38 で繋いでみて
+> `ssh isucon@3.115.92.38` で繋いでみて
 
 > コードを手元にもってきてgit管理しつつ、deploy, bench走行までをscript化して
 
