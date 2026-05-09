@@ -467,7 +467,7 @@ impl Store {
         let bytes = Bytes::from(serde_json::to_vec(&camp.to_response(campaign_id)).unwrap_or_default());
         self.campaign_json_cache.write()
             .insert(campaign_id.to_string(), bytes);
-        self.list_cache.write().clear();
+        *self.list_cache_dirty.write() = true;
     }
 }
 
@@ -854,8 +854,10 @@ async fn create_user(
         name: req.name.clone(), credit_limit, open_credit_used: 0,
     });
 
-    let event = SyncEvent::UserCreated { id: id.clone(), name: req.name.clone(), credit_limit };
-    broadcast_sync(&state, &event).await;
+    if !state.replica_urls.is_empty() {
+        let event = SyncEvent::UserCreated { id: id.clone(), name: req.name.clone(), credit_limit };
+        broadcast_sync(&state, &event).await;
+    }
 
     Ok(Json(UserRes { id, name: req.name, credit_limit }))
 }
@@ -940,26 +942,26 @@ async fn list_campaigns(
         return Ok(response_from_json_bytes(body));
     }
 
-    // Cache miss: compute just this key
+    // Cache miss: sort+truncate references first, then to_response only top 30
     let d = state.store.data.read();
     let filter_tag_names: Vec<String> =
         tag_ids.iter().filter_map(|id| d.tag_name_by_id.get(id).cloned()).collect();
-    let mut open: Vec<CampaignRes> = d.campaigns.iter()
+    let mut refs: Vec<(&String, &MemCampaign)> = d.campaigns.iter()
         .filter(|(_, c)| c.status == "open")
         .filter(|(_, c)| filter_tag_names.iter().all(|tag| c.tags.contains(tag)))
-        .map(|(id, c)| c.to_response(id))
         .collect();
-    drop(d);
     if sort_mode == "active" {
-        open.sort_by(|a, b| {
-            let ak = a.last_joined_at.unwrap_or(a.created_at);
-            let bk = b.last_joined_at.unwrap_or(b.created_at);
+        refs.sort_by(|a, b| {
+            let ak = a.1.last_joined_at.unwrap_or(a.1.created_at);
+            let bk = b.1.last_joined_at.unwrap_or(b.1.created_at);
             bk.cmp(&ak)
         });
     } else {
-        open.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        refs.sort_by(|a, b| b.1.created_at.cmp(&a.1.created_at));
     }
-    open.truncate(30);
+    refs.truncate(30);
+    let open: Vec<CampaignRes> = refs.iter().map(|(id, c)| c.to_response(id)).collect();
+    drop(d);
     let bytes = Bytes::from(serde_json::to_vec(&open).unwrap_or_default());
     state.store.list_cache.write().insert(cache_key, bytes.clone());
     Ok(response_from_json_bytes(bytes))
@@ -1107,12 +1109,14 @@ async fn create_campaign(
 
     state.store.invalidate_campaign(&id, &camp_clone);
 
-    let event = SyncEvent::CampaignCreated {
-        id: id.clone(), name: camp_clone.name.to_string(), description: camp_clone.description.to_string(),
-        price: camp_clone.price, goal_count: camp_clone.goal_count,
-        created_at: camp_clone.created_at, tags: camp_clone.tags.to_vec(), tag_ids: camp_clone.tag_ids,
-    };
-    broadcast_sync(&state, &event).await;
+    if !state.replica_urls.is_empty() {
+        let event = SyncEvent::CampaignCreated {
+            id: id.clone(), name: camp_clone.name.to_string(), description: camp_clone.description.to_string(),
+            price: camp_clone.price, goal_count: camp_clone.goal_count,
+            created_at: camp_clone.created_at, tags: camp_clone.tags.to_vec(), tag_ids: camp_clone.tag_ids,
+        };
+        broadcast_sync(&state, &event).await;
+    }
 
     let image = write_campaign_image_file(&state, &id, &image_bytes).await?;
     state.store.campaign_image.write().await.insert(id, image);
@@ -1234,9 +1238,9 @@ async fn join_campaign(
         state.store.list_cache.write().clear();
     }
 
-    // Sync to replicas
-    {
-        let closed = response.status == "closed";
+    // Sync to replicas (skip construction if no replicas)
+    if !state.replica_urls.is_empty() {
+        let closed = response.current_count >= response.goal_count;
         let close_ids: Vec<String> = if closed {
             response.participants.iter().map(|p| p.user_id.clone()).collect()
         } else { Vec::new() };
@@ -1325,10 +1329,12 @@ async fn create_saved_search(
         id: ss_id, user_id: user_id_s.clone(), tag_ids: tag_id_vec.clone(), created_at: now,
     });
 
-    let event = SyncEvent::SavedSearchCreated {
-        user_id: user_id_s, tag_ids: tag_id_vec.into_iter().collect(),
-    };
-    broadcast_sync(&state, &event).await;
+    if !state.replica_urls.is_empty() {
+        let event = SyncEvent::SavedSearchCreated {
+            user_id: user_id_s, tag_ids: tag_id_vec.into_iter().collect(),
+        };
+        broadcast_sync(&state, &event).await;
+    }
 
     Ok(StatusCode::CREATED)
 }
