@@ -859,6 +859,7 @@ async fn create_user(
 
 async fn get_me(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Response, AppError> {
     let user_id_s = user_id;
@@ -866,7 +867,7 @@ async fn get_me(
     {
         let d = state.store.data.read();
         if let Some(cached) = d.me_cache.get(&user_id_s) {
-            return Ok(response_gzipped_json(cached.clone()));
+            return Ok(respond_cached_json(cached.clone(), &headers));
         }
     }
     // Cache miss: build and store
@@ -881,7 +882,7 @@ async fn get_me(
     drop(d);
     let bytes = json_to_gzip(&result);
     state.store.data.write().me_cache.insert(user_id_s, bytes.clone());
-    Ok(response_gzipped_json(bytes))
+    Ok(respond_cached_json(bytes, &headers))
 }
 
 // ── Tags ──
@@ -910,11 +911,28 @@ fn json_to_gzip(data: &impl Serialize) -> Bytes {
     gzip_compress(&raw)
 }
 
-fn response_gzipped_json(body: Bytes) -> Response {
-    (StatusCode::OK, [
-        (header::CONTENT_TYPE, "application/json"),
-        (header::CONTENT_ENCODING, "gzip"),
-    ], Body::from(body)).into_response()
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers.get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("gzip"))
+        .unwrap_or(false)
+}
+
+fn respond_cached_json(gzipped: Bytes, headers: &HeaderMap) -> Response {
+    if accepts_gzip(headers) {
+        (StatusCode::OK, [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CONTENT_ENCODING, "gzip"),
+        ], Body::from(gzipped)).into_response()
+    } else {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut decoder = GzDecoder::new(gzipped.as_ref());
+        let mut raw = Vec::new();
+        let _ = decoder.read_to_end(&mut raw);
+        (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")],
+         Body::from(raw)).into_response()
+    }
 }
 
 fn response_from_json_bytes(body: Bytes) -> Response {
@@ -924,6 +942,7 @@ fn response_from_json_bytes(body: Bytes) -> Response {
 
 async fn list_campaigns(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumQuery(q): AxumQuery<ListCampaignsQuery>,
 ) -> Result<Response, AppError> {
     let mut tag_ids: Vec<String> = match q.tags.as_deref() {
@@ -955,7 +974,7 @@ async fn list_campaigns(
 
     // Check cache
     if let Some(body) = state.store.list_cache.read().get(&cache_key).cloned() {
-        return Ok(response_gzipped_json(body));
+        return Ok(respond_cached_json(body, &headers));
     }
 
     // Cache miss: compute just this key
@@ -980,17 +999,18 @@ async fn list_campaigns(
     open.truncate(30);
     let bytes = json_to_gzip(&open);
     state.store.list_cache.write().insert(cache_key, bytes.clone());
-    Ok(response_gzipped_json(bytes))
+    Ok(respond_cached_json(bytes, &headers))
 }
 
 async fn get_campaign(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(_user): Extension<AuthUser>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, AppError> {
     // Check pre-serialized cache
     if let Some(body) = state.store.campaign_json_cache.read().get(&id).cloned() {
-        return Ok(response_gzipped_json(body));
+        return Ok(respond_cached_json(body, &headers));
     }
     let d = state.store.data.read();
     let camp = d.campaigns.get(&id).ok_or(AppError::NotFound)?;
@@ -998,7 +1018,7 @@ async fn get_campaign(
     drop(d);
     let body = json_to_gzip(&res);
     state.store.campaign_json_cache.write().insert(id, body.clone());
-    Ok(response_gzipped_json(body))
+    Ok(respond_cached_json(body, &headers))
 }
 
 // ── Campaign image ──
@@ -1145,6 +1165,7 @@ struct JoinReq {}
 
 async fn join_campaign(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
     AxumPath(campaign_id): AxumPath<String>,
     _body: axum::body::Bytes,
@@ -1296,7 +1317,7 @@ async fn join_campaign(
         }
     }
 
-    Ok(response_gzipped_json(response_bytes))
+    Ok(respond_cached_json(response_bytes, &headers))
 }
 
 // ── Saved searches ──
