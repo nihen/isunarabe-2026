@@ -29,6 +29,7 @@ struct AppState {
     pool: MySqlPool,
     sql_dir: PathBuf,
     image_dir: PathBuf,
+    seed_image_dir: PathBuf,
     db: Arc<DbConn>,
     cache: Arc<AppCache>,
     webhook_tx: mpsc::Sender<WebhookMessage>,
@@ -122,6 +123,9 @@ async fn main() {
     let image_dir = std::env::var("IMAGE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("nrb2026-webapp-images"));
+    let seed_image_dir = std::env::var("SEED_IMAGE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| image_dir.join("seed"));
 
     let http = reqwest::Client::new();
     let (webhook_tx, webhook_rx) = mpsc::channel(8192);
@@ -131,6 +135,7 @@ async fn main() {
         pool,
         sql_dir,
         image_dir,
+        seed_image_dir,
         db: Arc::new(db),
         cache: Arc::new(AppCache::default()),
         webhook_tx,
@@ -448,6 +453,43 @@ async fn write_campaign_image_file(
         .map_err(|e| AppError::Internal(format!("write image {}: {e}", path.display())))?;
     let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(bytes)));
     Ok(ImageCache { path, etag })
+}
+
+async fn image_cache_from_file(path: PathBuf) -> Result<Option<ImageCache>, AppError> {
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(AppError::Internal(format!(
+                "read image {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(&bytes)));
+    Ok(Some(ImageCache { path, etag }))
+}
+
+async fn load_campaign_image(state: &AppState, campaign_id: &str) -> Result<ImageCache, AppError> {
+    let seed_path = state.seed_image_dir.join(format!("{campaign_id}.jpg"));
+    if let Some(image) = image_cache_from_file(seed_path).await? {
+        return Ok(image);
+    }
+
+    let dynamic_path = state.image_dir.join(format!("{campaign_id}.jpg"));
+    if let Some(image) = image_cache_from_file(dynamic_path).await? {
+        return Ok(image);
+    }
+
+    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT image FROM campaigns WHERE id = ?")
+        .bind(campaign_id)
+        .fetch_optional(&state.pool)
+        .await?;
+    let bytes = match row {
+        Some((bytes,)) => bytes,
+        None => return Err(AppError::NotFound),
+    };
+    write_campaign_image_file(state, campaign_id, &bytes).await
 }
 
 async fn healthz(State(state): State<AppState>) -> StatusCode {
@@ -979,12 +1021,12 @@ async fn warm_read_cache(state: &AppState) -> Result<(), AppError> {
     let list_cache = build_warmed_list_cache(&open_campaigns, &tag_ids_by_name)?;
     *state.cache.list_campaigns_json.write().await = list_cache;
 
-    let image_rows: Vec<(String, Vec<u8>)> = sqlx::query_as("SELECT id, image FROM campaigns")
+    let image_rows: Vec<(String,)> = sqlx::query_as("SELECT id FROM campaigns")
         .fetch_all(&state.pool)
         .await?;
     let mut image_cache = HashMap::with_capacity(image_rows.len());
-    for (id, bytes) in image_rows {
-        let image = write_campaign_image_file(state, &id, &bytes).await?;
+    for (id,) in image_rows {
+        let image = load_campaign_image(state, &id).await?;
         image_cache.insert(id, image);
     }
     *state.cache.campaign_image.write().await = image_cache;
@@ -1166,15 +1208,7 @@ async fn get_campaign_image(
         return image_response(image, &headers).await;
     }
 
-    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT image FROM campaigns WHERE id = ?")
-        .bind(&id)
-        .fetch_optional(&state.pool)
-        .await?;
-    let bytes = match row {
-        Some((b,)) => b,
-        None => return Err(AppError::NotFound),
-    };
-    let image = write_campaign_image_file(&state, &id, &bytes).await?;
+    let image = load_campaign_image(&state, &id).await?;
     state
         .cache
         .campaign_image

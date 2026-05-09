@@ -4,6 +4,7 @@ webapp/target/
 
 # Large seed data (236M) — fetched separately via scripts/seed-fetch.sh
 webapp/sql/seed.sql
+webapp/images/
 
 # Local env / secrets
 .env
