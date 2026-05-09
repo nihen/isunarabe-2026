@@ -467,9 +467,7 @@ async fn get_me(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Response, AppError> {
     let user_id_s = user_id.to_string();
-    if let Some(body) = state.cache.me_json.read().await.get(&user_id_s).cloned() {
-        return Ok(response_from_json_bytes(body));
-    }
+    // me_json cache disabled — mutable per-user state is unsafe with multi-server LB.
 
     let row: Option<(String, i32)> =
         sqlx::query_as("SELECT name, credit_limit FROM users WHERE id = ?")
@@ -487,12 +485,6 @@ async fn get_me(
         credit_used: credit_used as i32,
     };
     let body = serialize_json(&res)?;
-    state
-        .cache
-        .me_json
-        .write()
-        .await
-        .insert(user_id_s, body.clone());
     Ok(response_from_json_bytes(body))
 }
 
@@ -571,16 +563,7 @@ async fn list_campaigns(
     };
     tag_ids.sort();
     let list_cache_key = format!("sort={sort_mode};tags={}", tag_ids.join(","));
-    if let Some(body) = state
-        .cache
-        .list_campaigns_json
-        .read()
-        .await
-        .get(&list_cache_key)
-        .cloned()
-    {
-        return Ok(response_from_json_bytes(body));
-    }
+    // list_campaigns_json cache disabled — unsafe with multi-server LB.
 
     let mut qb = QueryBuilder::<MySql>::new(
         "SELECT c.id, c.name, c.description, c.price, c.goal_count, c.created_at, \
@@ -662,12 +645,6 @@ async fn list_campaigns(
         .collect();
 
     let body = serialize_json(&all)?;
-    state
-        .cache
-        .list_campaigns_json
-        .write()
-        .await
-        .insert(list_cache_key, body.clone());
     Ok(response_from_json_bytes(body))
 }
 
@@ -1003,20 +980,12 @@ async fn get_campaign(
     Extension(_user): Extension<AuthUser>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, AppError> {
-    if let Some(body) = state.cache.campaign_json.read().await.get(&id).cloned() {
-        return Ok(response_from_json_bytes(body));
-    }
+    // campaign_json cache disabled — unsafe with multi-server LB.
 
     let campaign = hydrate_campaign_via_pool(&state.pool, &id)
         .await?
         .ok_or(AppError::NotFound)?;
     let body = serialize_json(&campaign)?;
-    state
-        .cache
-        .campaign_json
-        .write()
-        .await
-        .insert(id, body.clone());
     Ok(response_from_json_bytes(body))
 }
 
@@ -1149,23 +1118,7 @@ async fn join_campaign(
         url_row.map(|(v,)| v).unwrap_or_default()
     };
 
-    // Invalidate caches BEFORE commit to prevent stale reads between commit and clear.
-    state.cache.clear_list_campaigns().await;
-    state
-        .cache
-        .clear_users(cache_clear_user_ids.iter().map(String::as_str))
-        .await;
-    state.cache.campaign_json.write().await.remove(&campaign_id);
-
     tx.commit().await?;
-
-    // Re-populate campaign cache with fresh data.
-    state
-        .cache
-        .campaign_json
-        .write()
-        .await
-        .insert(campaign_id.clone(), serialize_json(&response_campaign)?);
 
     if !webhook_user_ids.is_empty() && !webhook_url.is_empty() {
         for uid in &webhook_user_ids {
@@ -1290,16 +1243,7 @@ async fn list_charges(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Response, AppError> {
     let user_id_s = user_id.to_string();
-    if let Some(body) = state
-        .cache
-        .charges_json
-        .read()
-        .await
-        .get(&user_id_s)
-        .cloned()
-    {
-        return Ok(response_from_json_bytes(body));
-    }
+    // charges_json cache disabled — unsafe with multi-server LB.
 
     let rows: Vec<(String, NaiveDateTime, String, String, i32)> = sqlx::query_as(
         "SELECT ch.id, ch.created_at, c.id, c.name, c.price \
@@ -1326,12 +1270,6 @@ async fn list_charges(
         })
         .collect();
     let body = serialize_json(&res)?;
-    state
-        .cache
-        .charges_json
-        .write()
-        .await
-        .insert(user_id_s, body.clone());
     Ok(response_from_json_bytes(body))
 }
 
