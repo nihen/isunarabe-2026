@@ -381,7 +381,6 @@ async fn initialize(
     .await?;
 
     state.cache.clear_all().await;
-    warm_read_cache(&state).await?;
 
     Ok(Json(serde_json::json!({})))
 }
