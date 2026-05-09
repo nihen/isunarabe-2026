@@ -46,8 +46,10 @@ AI との協働で一番効いたのは、**失敗を前提にした試行回数
 **全体設計プランの策定**
 
 > このwebappの全エンドポイントとその機能を.plansにかきだして
+> → X-User-IDの情報をもとにnginxが水平分散する最適化案はありうるか
+> → （水平分散の議論を経て）.plansにかいて！
 
-（→ Claude Code へ。エンドポイント一覧を整理させた後、`.plans/webapp-theoretical-fastest-plan.md` という「理論上最速化プラン」を作らせた。515行、Phase 1〜8 に分けた段階的な設計書で、以下が骨子:
+（→ Claude Code へ。まずエンドポイント一覧を整理させ、水平分散の可否を議論し、最終的に `.plans/webapp-theoretical-fastest-plan.md` という「理論上最速化プラン」を作らせた。515行、Phase 1〜8 に分けた段階的な設計書で、以下が骨子:
 
 1. DB index追加 + SQL集約（安全なベースライン引き上げ）
 2. アプリ内 read-through cache
