@@ -12,11 +12,11 @@ SERVERS=(
 # nrb2026-bench: private 192.168.0.100
 BENCH="13.193.122.121"
 
-# Topology: app, app, mysql (Phase 1).
-# nrb2026-1,-2 run nrb2026-webapp; nrb2026-3 is DB-only.
-APP_SERVERS=("${SERVERS[0]}" "${SERVERS[1]}")    # 3.115.92.38, 35.76.59.65
-DB_SERVER="${SERVERS[2]}"                         # 35.72.99.228
+# Topology: all 3 run webapp (same config). mysql only on nrb2026-3.
+APP_SERVERS=("${SERVERS[@]}")                     # all 3 run webapp
+DB_SERVER="${SERVERS[2]}"                         # 35.72.99.228 also runs mysql
 DB_PRIVATE_IP="192.168.0.13"
+NO_MYSQL=("${SERVERS[0]}" "${SERVERS[1]}")        # mysql disabled on 1, 2
 
 SSH_USER="isucon"
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=30)
