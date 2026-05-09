@@ -28,6 +28,8 @@ const DEFAULT_CREDIT_LIMIT: i32 = 60000;
 struct AppState {
     pool: MySqlPool,
     sql_dir: PathBuf,
+    image_dir: PathBuf,
+    seed_image_dir: PathBuf,
     db: Arc<DbConn>,
     cache: Arc<AppCache>,
     webhook_tx: mpsc::Sender<WebhookMessage>,
@@ -63,7 +65,7 @@ struct AppCache {
 
 #[derive(Clone)]
 struct ImageCache {
-    bytes: Arc<Vec<u8>>,
+    path: PathBuf,
     etag: String,
 }
 
@@ -110,6 +112,12 @@ async fn main() {
     let sql_dir = std::env::var("SQL_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sql"));
+    let image_dir = std::env::var("IMAGE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("nrb2026-webapp-images"));
+    let seed_image_dir = std::env::var("SEED_IMAGE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| image_dir.join("seed"));
 
     let http = reqwest::Client::new();
     let (webhook_tx, webhook_rx) = mpsc::channel(8192);
@@ -118,6 +126,8 @@ async fn main() {
     let state = AppState {
         pool,
         sql_dir,
+        image_dir,
+        seed_image_dir,
         db: Arc::new(db),
         cache: Arc::new(AppCache::default()),
         webhook_tx,
@@ -381,8 +391,87 @@ async fn initialize(
     .await?;
 
     state.cache.clear_all().await;
+    reset_image_dir(&state).await?;
 
     Ok(Json(serde_json::json!({})))
+}
+
+async fn reset_image_dir(state: &AppState) -> Result<(), AppError> {
+    match tokio::fs::remove_dir_all(&state.image_dir).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(AppError::Internal(format!(
+                "remove image dir {}: {e}",
+                state.image_dir.display()
+            )));
+        }
+    }
+    tokio::fs::create_dir_all(&state.image_dir)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "create image dir {}: {e}",
+                state.image_dir.display()
+            ))
+        })?;
+    Ok(())
+}
+
+async fn write_campaign_image_file(
+    state: &AppState,
+    campaign_id: &str,
+    bytes: &[u8],
+) -> Result<ImageCache, AppError> {
+    tokio::fs::create_dir_all(&state.image_dir)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "create image dir {}: {e}",
+                state.image_dir.display()
+            ))
+        })?;
+    let path = state.image_dir.join(format!("{campaign_id}.jpg"));
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|e| AppError::Internal(format!("write image {}: {e}", path.display())))?;
+    let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(bytes)));
+    Ok(ImageCache { path, etag })
+}
+
+async fn image_cache_from_file(path: PathBuf) -> Result<Option<ImageCache>, AppError> {
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(AppError::Internal(format!(
+                "read image {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(&bytes)));
+    Ok(Some(ImageCache { path, etag }))
+}
+
+async fn load_campaign_image(state: &AppState, campaign_id: &str) -> Result<ImageCache, AppError> {
+    let seed_path = state.seed_image_dir.join(format!("{campaign_id}.jpg"));
+    if let Some(image) = image_cache_from_file(seed_path).await? {
+        return Ok(image);
+    }
+    let dynamic_path = state.image_dir.join(format!("{campaign_id}.jpg"));
+    if let Some(image) = image_cache_from_file(dynamic_path).await? {
+        return Ok(image);
+    }
+    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT image FROM campaigns WHERE id = ?")
+        .bind(campaign_id)
+        .fetch_optional(&state.pool)
+        .await?;
+    let bytes = match row {
+        Some((bytes,)) => bytes,
+        None => return Err(AppError::NotFound),
+    };
+    write_campaign_image_file(state, campaign_id, &bytes).await
 }
 
 async fn healthz(State(state): State<AppState>) -> StatusCode {
@@ -806,21 +895,7 @@ async fn warm_read_cache(state: &AppState) -> Result<(), AppError> {
     list_cache.insert("sort=active;tags=".to_string(), serialize_json(&active)?);
     *state.cache.list_campaigns_json.write().await = list_cache;
 
-    let image_rows: Vec<(String, Vec<u8>)> = sqlx::query_as("SELECT id, image FROM campaigns")
-        .fetch_all(&state.pool)
-        .await?;
-    let mut image_cache = HashMap::with_capacity(image_rows.len());
-    for (id, bytes) in image_rows {
-        let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(&bytes)));
-        image_cache.insert(
-            id,
-            ImageCache {
-                bytes: Arc::new(bytes),
-                etag,
-            },
-        );
-    }
-    *state.cache.campaign_image.write().await = image_cache;
+    // Image cache warms lazily via load_campaign_image (seed dir → dynamic dir → DB fallback).
 
     Ok(())
 }
@@ -915,14 +990,8 @@ async fn create_campaign(
         .write()
         .await
         .insert(id.clone(), serialize_json(&res)?);
-    let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(&image_bytes)));
-    state.cache.campaign_image.write().await.insert(
-        id,
-        ImageCache {
-            bytes: Arc::new(image_bytes),
-            etag,
-        },
-    );
+    let image = write_campaign_image_file(&state, &id, &image_bytes).await?;
+    state.cache.campaign_image.write().await.insert(id, image);
     Ok((StatusCode::CREATED, Json(res)))
 }
 
@@ -933,51 +1002,42 @@ async fn get_campaign_image(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, AppError> {
     if let Some(image) = state.cache.campaign_image.read().await.get(&id).cloned() {
-        return Ok(image_response(image, &headers));
+        return image_response(image, &headers).await;
     }
 
-    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT image FROM campaigns WHERE id = ?")
-        .bind(&id)
-        .fetch_optional(&state.pool)
-        .await?;
-    let bytes = match row {
-        Some((b,)) => b,
-        None => return Err(AppError::NotFound),
-    };
-    let hash_hex = hex::encode(sha2::Sha256::digest(&bytes));
-    let etag = format!("\"{hash_hex}\"");
-    let image = ImageCache {
-        bytes: Arc::new(bytes),
-        etag,
-    };
+    let image = load_campaign_image(&state, &id).await?;
     state
         .cache
         .campaign_image
         .write()
         .await
         .insert(id, image.clone());
-    Ok(image_response(image, &headers))
+    image_response(image, &headers).await
 }
 
-fn image_response(image: ImageCache, headers: &HeaderMap) -> Response {
+async fn image_response(image: ImageCache, headers: &HeaderMap) -> Result<Response, AppError> {
     let not_modified = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
         .map(|value| value == image.etag)
         .unwrap_or(false);
     if not_modified {
-        return (StatusCode::NOT_MODIFIED, [(header::ETAG, image.etag)]).into_response();
+        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, image.etag)]).into_response());
     }
 
-    (
+    let bytes = tokio::fs::read(&image.path)
+        .await
+        .map_err(|e| AppError::Internal(format!("read image {}: {e}", image.path.display())))?;
+
+    Ok((
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "image/jpeg".to_string()),
             (header::ETAG, image.etag),
         ],
-        Body::from(image.bytes.as_ref().clone()),
+        Body::from(bytes),
     )
-        .into_response()
+        .into_response())
 }
 
 async fn get_campaign(
